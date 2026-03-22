@@ -5,7 +5,7 @@ from datetime import datetime
 import httpx
 
 from app.core.settings import get_settings
-from app.services.analysis_safety import round_or_none, safe_ratio, winsorized_mean
+from app.services.analysis_safety import robust_baseline, round_or_none, safe_ratio
 from app.utils.cache import TTLCache
 
 
@@ -315,15 +315,47 @@ class WorldBankProvider(BaseHttpProvider):
 
 def summarize_peer_averages(rows: list[dict]) -> dict[str, float | None]:
     if not rows:
-        return {"pe_ratio": None, "pb_ratio": None, "roe_pct": None, "revenue_growth_pct": None, "debt_to_equity": None}
+        return {
+            "pe_ratio": None,
+            "pb_ratio": None,
+            "roe_pct": None,
+            "revenue_growth_pct": None,
+            "debt_to_equity": None,
+            "pe_ratio_valid_count": 0,
+            "pb_ratio_valid_count": 0,
+            "roe_pct_valid_count": 0,
+            "revenue_growth_pct_valid_count": 0,
+            "debt_to_equity_valid_count": 0,
+            "pe_ratio_baseline_noisy": True,
+            "pb_ratio_baseline_noisy": True,
+            "roe_pct_baseline_noisy": True,
+            "revenue_growth_pct_baseline_noisy": True,
+            "debt_to_equity_baseline_noisy": True,
+        }
 
     def collect(metric: str) -> list[float]:
         return [float(value) for row in rows if (value := row.get(metric)) is not None]
 
+    pe_ratio, pe_count, pe_noisy = robust_baseline(collect("pe_ratio"), prefer_median=True)
+    pb_ratio, pb_count, pb_noisy = robust_baseline(collect("pb_ratio"), prefer_median=True)
+    roe_pct, roe_count, roe_noisy = robust_baseline(collect("roe_pct"))
+    growth_pct, growth_count, growth_noisy = robust_baseline(collect("revenue_growth_pct"))
+    debt_to_equity, debt_count, debt_noisy = robust_baseline(collect("debt_to_equity"))
+
     return {
-        "pe_ratio": round_or_none(winsorized_mean(collect("pe_ratio")), 2),
-        "pb_ratio": round_or_none(winsorized_mean(collect("pb_ratio")), 2),
-        "roe_pct": round_or_none(winsorized_mean(collect("roe_pct")), 2),
-        "revenue_growth_pct": round_or_none(winsorized_mean(collect("revenue_growth_pct")), 2),
-        "debt_to_equity": round_or_none(winsorized_mean(collect("debt_to_equity")), 2),
+        "pe_ratio": round_or_none(pe_ratio, 2),
+        "pb_ratio": round_or_none(pb_ratio, 2),
+        "roe_pct": round_or_none(roe_pct, 2),
+        "revenue_growth_pct": round_or_none(growth_pct, 2),
+        "debt_to_equity": round_or_none(debt_to_equity, 2),
+        "pe_ratio_valid_count": pe_count,
+        "pb_ratio_valid_count": pb_count,
+        "roe_pct_valid_count": roe_count,
+        "revenue_growth_pct_valid_count": growth_count,
+        "debt_to_equity_valid_count": debt_count,
+        "pe_ratio_baseline_noisy": pe_noisy,
+        "pb_ratio_baseline_noisy": pb_noisy,
+        "roe_pct_baseline_noisy": roe_noisy,
+        "revenue_growth_pct_baseline_noisy": growth_noisy,
+        "debt_to_equity_baseline_noisy": debt_noisy,
     }
