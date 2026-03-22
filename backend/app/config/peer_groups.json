@@ -1,0 +1,50 @@
+{
+  "rules": [
+    {
+      "name": "technology-core",
+      "sector": "Technology",
+      "industry_contains": ["Software", "Semiconductor", "Consumer Electronics", "Internet"],
+      "tickers": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "ORCL", "ADBE", "CRM", "AMD"]
+    },
+    {
+      "name": "financials-core",
+      "sector": "Financial Services",
+      "industry_contains": ["Bank", "Asset Management", "Insurance"],
+      "tickers": ["JPM", "BAC", "WFC", "GS", "MS", "BLK", "SCHW", "C", "AXP"]
+    },
+    {
+      "name": "healthcare-core",
+      "sector": "Healthcare",
+      "industry_contains": ["Drug", "Biotech", "Medical", "Healthcare"],
+      "tickers": ["LLY", "JNJ", "PFE", "MRK", "ABBV", "TMO", "ABT", "DHR", "ISRG"]
+    },
+    {
+      "name": "energy-core",
+      "sector": "Energy",
+      "industry_contains": ["Oil", "Gas", "Energy"],
+      "tickers": ["XOM", "CVX", "COP", "SLB", "EOG", "PSX", "MPC"]
+    },
+    {
+      "name": "industrial-core",
+      "sector": "Industrials",
+      "industry_contains": ["Aerospace", "Industrial", "Rail", "Machinery"],
+      "tickers": ["GE", "CAT", "DE", "RTX", "HON", "UNP", "LMT", "UPS"]
+    },
+    {
+      "name": "consumer-cyclical-core",
+      "sector": "Consumer Cyclical",
+      "industry_contains": ["Automobile", "Retail", "Travel", "Home"],
+      "tickers": ["TSLA", "HD", "MCD", "NKE", "SBUX", "BKNG", "LOW", "TJX"]
+    },
+    {
+      "name": "communication-core",
+      "sector": "Communication Services",
+      "industry_contains": ["Internet", "Entertainment", "Media", "Telecom"],
+      "tickers": ["GOOGL", "META", "NFLX", "TMUS", "DIS", "CMCSA", "VZ", "T"]
+    }
+  ],
+  "fallback": {
+    "tickers": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "LLY", "XOM", "GE", "TSLA"]
+  }
+}
+

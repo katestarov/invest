@@ -1,0 +1,31 @@
+{
+  "weights": {
+    "profitability": 0.27,
+    "stability": 0.19,
+    "valuation": 0.2,
+    "growth": 0.19,
+    "market": 0.08,
+    "macro": 0.07
+  },
+  "caps": {
+    "roe_pct": 50,
+    "roic_pct": 35,
+    "ebit_margin_pct": 40,
+    "debt_to_equity": 2.5,
+    "current_ratio": 2.5,
+    "revenue_growth_pct": 35,
+    "fcf_margin_pct": 30,
+    "five_year_return_pct": 250,
+    "pe_premium_pct": 100,
+    "pb_premium_pct": 100
+  },
+  "labels": {
+    "profitability": "Рентабельность (Profitability)",
+    "stability": "Устойчивость (Stability)",
+    "valuation": "Оценка относительно сектора (Valuation)",
+    "growth": "Рост (Growth)",
+    "market": "Рыночная динамика (Market Momentum)",
+    "macro": "Макросреда (Macro)"
+  }
+}
+
