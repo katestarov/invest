@@ -5,6 +5,10 @@ type Props = {
   selectedTicker: string;
 };
 
+function displayValue(value: number | null, suffix = "") {
+  return value === null ? "N/A" : `${value}${suffix}`;
+}
+
 export function PeerTableRu({ rows, selectedTicker }: Props) {
   return (
     <div className="panel">
@@ -32,9 +36,9 @@ export function PeerTableRu({ rows, selectedTicker }: Props) {
                 <td>{row.company}</td>
                 <td>{row.score}</td>
                 <td>${row.market_cap_bln}B</td>
-                <td>{row.pe_ratio}</td>
-                <td>{row.roe_pct}%</td>
-                <td>{row.revenue_growth_pct}%</td>
+                <td>{displayValue(row.pe_ratio)}</td>
+                <td>{displayValue(row.roe_pct, "%")}</td>
+                <td>{displayValue(row.revenue_growth_pct, "%")}</td>
               </tr>
             ))}
           </tbody>
@@ -43,4 +47,3 @@ export function PeerTableRu({ rows, selectedTicker }: Props) {
     </div>
   );
 }
-

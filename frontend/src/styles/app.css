@@ -228,6 +228,7 @@ button, input { font: inherit; }
 
 .up { color: var(--accent); }
 .down { color: var(--warning); }
+.neutral { color: var(--muted); }
 
 .dashboard-grid {
   display: grid;

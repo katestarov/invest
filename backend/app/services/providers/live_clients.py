@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from statistics import mean
-
 import httpx
 
 from app.core.settings import get_settings
+from app.services.analysis_safety import round_or_none, safe_ratio, winsorized_mean
 from app.utils.cache import TTLCache
 
 
@@ -199,6 +198,12 @@ class SecEdgarProvider(BaseHttpProvider):
 
         latest_revenue = revenues[0] if revenues else 0.0
         latest_fcf = fcf[0] if fcf else 0.0
+        current_ratio = safe_ratio(latest_current_assets, latest_current_liabilities)
+        debt_to_equity = safe_ratio(max(latest_liabilities - latest_equity, 0), latest_equity)
+        roic_pct = safe_ratio(latest_operating_income, latest_equity)
+        ebit_margin_pct = safe_ratio(latest_operating_income, latest_revenue * 1_000_000_000 if latest_revenue else None)
+        fcf_margin_pct = safe_ratio(latest_fcf, latest_revenue)
+
         payload = {
             "cik": cik,
             "company": submissions.get("name") or facts.get("entityName") or ticker,
@@ -206,11 +211,11 @@ class SecEdgarProvider(BaseHttpProvider):
             "sector": _map_sector(sic_description),
             "revenue_bln": revenues,
             "free_cash_flow_bln": fcf,
-            "current_ratio": round(latest_current_assets / latest_current_liabilities, 2) if latest_current_liabilities else 0.0,
-            "debt_to_equity": round(max(latest_liabilities - latest_equity, 0) / latest_equity, 2) if latest_equity else 0.0,
-            "roic_pct": round((latest_operating_income / latest_equity) * 100, 2) if latest_equity else 0.0,
-            "ebit_margin_pct": round((latest_operating_income / (latest_revenue * 1_000_000_000)) * 100, 2) if latest_revenue else 0.0,
-            "fcf_margin_pct": round((latest_fcf / latest_revenue) * 100, 2) if latest_revenue else 0.0,
+            "current_ratio": round_or_none(current_ratio, 2),
+            "debt_to_equity": round_or_none(debt_to_equity, 2),
+            "roic_pct": round_or_none(roic_pct * 100 if roic_pct is not None else None, 2),
+            "ebit_margin_pct": round_or_none(ebit_margin_pct * 100 if ebit_margin_pct is not None else None, 2),
+            "fcf_margin_pct": round_or_none(fcf_margin_pct * 100 if fcf_margin_pct is not None else None, 2),
             "net_income_bln": round(latest_net_income / 1_000_000_000, 2),
             "shares_outstanding_mln": round(latest_shares_outstanding / 1_000_000, 2),
             "history": [
@@ -231,6 +236,8 @@ class SecEdgarProvider(BaseHttpProvider):
             warnings.append("SEC EDGAR не вернул достаточно данных для расчёта свободного денежного потока.")
         if not latest_shares_outstanding:
             warnings.append("SEC EDGAR не вернул число акций в обращении, часть рыночных коэффициентов будет приближённой.")
+        if latest_equity <= 0:
+            warnings.append("Negative equity detected: ROE, Debt/Equity and P/B may be unreliable")
         return ProviderResult(payload=payload, warnings=warnings)
 
 
@@ -241,7 +248,7 @@ class FredProvider(BaseHttpProvider):
         super().__init__()
         self.api_key = get_settings().fred_api_key
 
-    def _latest_value(self, series_id: str) -> float:
+    def _latest_value(self, series_id: str) -> float | None:
         data = self._get_json(
             "https://api.stlouisfed.org/fred/series/observations",
             params={
@@ -254,7 +261,7 @@ class FredProvider(BaseHttpProvider):
         )
         observations = [item for item in data.get("observations", []) if item.get("value") not in {".", None}]
         if not observations:
-            return 0.0
+            return None
         return _safe_number(observations[0]["value"])
 
     def fetch_macro_bundle(self) -> ProviderResult:
@@ -276,7 +283,7 @@ class FredProvider(BaseHttpProvider):
             },
         )
         cpi_values = [item for item in cpi_prev_year.get("observations", []) if item.get("value") not in {".", None}]
-        inflation = 0.0
+        inflation = None
         if len(cpi_values) >= 13:
             inflation = ((_safe_number(cpi_values[0]["value"]) / _safe_number(cpi_values[12]["value"])) - 1) * 100
 
@@ -284,7 +291,7 @@ class FredProvider(BaseHttpProvider):
             payload={
                 "fed_funds_rate_pct": self._latest_value("FEDFUNDS"),
                 "unemployment_pct": self._latest_value("UNRATE"),
-                "inflation_pct": round(inflation, 2),
+                "inflation_pct": round(inflation, 2) if inflation is not None else None,
             },
             warnings=[],
         )
@@ -301,18 +308,22 @@ class WorldBankProvider(BaseHttpProvider):
         series = payload[1] if isinstance(payload, list) and len(payload) > 1 else []
         latest = next((item for item in series if item.get("value") is not None), None)
         return ProviderResult(
-            payload={"gdp_growth_pct": _safe_number(latest.get("value")) if latest else 0.0},
+            payload={"gdp_growth_pct": _safe_number(latest.get("value")) if latest else None},
             warnings=[],
         )
 
 
-def summarize_peer_averages(rows: list[dict]) -> dict[str, float]:
+def summarize_peer_averages(rows: list[dict]) -> dict[str, float | None]:
     if not rows:
-        return {"pe_ratio": 0.0, "pb_ratio": 0.0, "roe_pct": 0.0, "revenue_growth_pct": 0.0, "debt_to_equity": 0.0}
+        return {"pe_ratio": None, "pb_ratio": None, "roe_pct": None, "revenue_growth_pct": None, "debt_to_equity": None}
+
+    def collect(metric: str) -> list[float]:
+        return [float(value) for row in rows if (value := row.get(metric)) is not None]
+
     return {
-        "pe_ratio": mean(row.get("pe_ratio", 0.0) for row in rows),
-        "pb_ratio": mean(row.get("pb_ratio", 0.0) for row in rows),
-        "roe_pct": mean(row.get("roe_pct", 0.0) for row in rows),
-        "revenue_growth_pct": mean(row.get("revenue_growth_pct", 0.0) for row in rows),
-        "debt_to_equity": mean(row.get("debt_to_equity", 0.0) for row in rows),
+        "pe_ratio": round_or_none(winsorized_mean(collect("pe_ratio")), 2),
+        "pb_ratio": round_or_none(winsorized_mean(collect("pb_ratio")), 2),
+        "roe_pct": round_or_none(winsorized_mean(collect("roe_pct")), 2),
+        "revenue_growth_pct": round_or_none(winsorized_mean(collect("revenue_growth_pct")), 2),
+        "debt_to_equity": round_or_none(winsorized_mean(collect("debt_to_equity")), 2),
     }

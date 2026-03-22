@@ -3,10 +3,13 @@ from pydantic import BaseModel, Field
 
 class MetricCard(BaseModel):
     label: str
-    value: float
+    value: float | None
     unit: str = ""
-    benchmark: float
+    benchmark: float | None
     direction: str
+    display_value: str | None = None
+    display_benchmark: str | None = None
+    comparison_label: str | None = None
     description: str
 
 
@@ -25,9 +28,9 @@ class PeerRow(BaseModel):
     industry: str
     score: float = Field(ge=0, le=100)
     market_cap_bln: float
-    pe_ratio: float
-    roe_pct: float
-    revenue_growth_pct: float
+    pe_ratio: float | None
+    roe_pct: float | None
+    revenue_growth_pct: float | None
 
 
 class FundamentalTrendPoint(BaseModel):
@@ -43,7 +46,7 @@ class PriceHistoryPoint(BaseModel):
 
 class MacroPoint(BaseModel):
     label: str
-    value: float
+    value: float | None
     unit: str
     source: str
 

@@ -4,7 +4,11 @@ type Props = {
   items: MacroPoint[];
 };
 
-function formatMacroValue(value: number) {
+function formatMacroValue(value: number | null) {
+  if (value === null) {
+    return "N/A";
+  }
+
   return value.toLocaleString("ru-RU", {
     maximumFractionDigits: 4,
   });
@@ -23,7 +27,7 @@ export function MacroPanel({ items }: Props) {
             <span>{item.label}</span>
             <strong>
               {formatMacroValue(item.value)}
-              {item.unit}
+              {item.value !== null ? item.unit : ""}
             </strong>
             <small>{item.source}</small>
           </div>
