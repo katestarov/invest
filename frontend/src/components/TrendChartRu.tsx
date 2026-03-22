@@ -22,8 +22,11 @@ export function TrendChartRu({ points }: Props) {
   const width = 480;
   const height = 240;
   const padding = 28;
-  const revenue = points.map((point) => point.revenue_bln);
-  const fcf = points.map((point) => point.free_cash_flow_bln);
+  const sortedPoints = [...points].sort((left, right) =>
+    left.period.localeCompare(right.period, undefined, { numeric: true }),
+  );
+  const revenue = sortedPoints.map((point) => point.revenue_bln);
+  const fcf = sortedPoints.map((point) => point.free_cash_flow_bln);
 
   return (
     <div className="panel">
@@ -34,10 +37,10 @@ export function TrendChartRu({ points }: Props) {
       <svg viewBox={`0 0 ${width} ${height}`} className="trend-chart">
         <path d={buildPath(revenue, width, height, padding)} className="trend-line revenue" />
         <path d={buildPath(fcf, width, height, padding)} className="trend-line fcf" />
-        {points.map((point, index) => (
+        {sortedPoints.map((point, index) => (
           <text
             key={point.period}
-            x={padding + (index * (width - padding * 2)) / Math.max(points.length - 1, 1)}
+            x={padding + (index * (width - padding * 2)) / Math.max(sortedPoints.length - 1, 1)}
             y={height - 8}
             textAnchor="middle"
             className="trend-label"

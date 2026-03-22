@@ -147,7 +147,9 @@ button, input { font: inherit; }
   display: grid;
   place-items: center;
   text-align: center;
-  padding-top: 6px;
+  align-content: center;
+  gap: 4px;
+  padding: 28px;
 }
 
 .score-ring-score {
@@ -155,26 +157,34 @@ button, input { font: inherit; }
   align-items: flex-start;
   justify-content: center;
   gap: 2px;
-  line-height: 0.92;
+  line-height: 0.88;
+  max-width: 100%;
 }
 
 .score-ring-whole {
-  font-size: 3.35rem;
+  font-size: clamp(2.8rem, 7vw, 3.35rem);
   font-weight: 800;
 }
 
 .score-ring-fraction {
   margin-top: 0.18em;
-  font-size: 1.8rem;
+  font-size: clamp(1.45rem, 3.6vw, 1.8rem);
   font-weight: 800;
 }
 
 .score-ring-label, .panel-head span, .breakdown-meta span, .trend-label { color: var(--muted); }
+.trend-label {
+  fill: var(--muted);
+  font-size: 12px;
+}
 
 .score-ring-content p {
-  margin: 10px 0 0;
-  max-width: 130px;
+  margin: 6px 0 0;
+  max-width: 148px;
   color: var(--muted);
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+  text-wrap: balance;
 }
 
 .hero-card-copy span {
@@ -289,7 +299,9 @@ button, input { font: inherit; }
 .macro-item strong {
   display: block;
   margin-top: 12px;
-  font-size: 1.8rem;
+  font-size: clamp(1.2rem, 3.2vw, 1.8rem);
+  line-height: 1.15;
+  overflow-wrap: anywhere;
 }
 
 .macro-item small {
@@ -335,4 +347,6 @@ th {
   .hero-copy, .hero-card, .panel, .metric-card { border-radius: 22px; }
   .ticker-form { flex-direction: column; }
   .score-ring-card { width: 190px; height: 190px; }
+  .score-ring-content { padding: 24px; }
+  .score-ring-content p { max-width: 122px; font-size: 0.82rem; }
 }
