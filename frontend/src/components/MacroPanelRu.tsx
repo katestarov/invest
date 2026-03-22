@@ -10,7 +10,8 @@ function formatMacroValue(value: number | null) {
   }
 
   return value.toLocaleString("ru-RU", {
-    maximumFractionDigits: 4,
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
   });
 }
 

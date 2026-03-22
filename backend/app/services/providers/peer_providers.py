@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from app.core.settings import get_settings
+from app.services.analysis_safety import get_business_type_universe
+from app.services.providers.live_clients import BaseHttpProvider
+
+
+@dataclass(frozen=True)
+class PeerCandidate:
+    ticker: str
+    source: str
+    raw_relevance_hint: float | None = None
+
+
+@dataclass(frozen=True)
+class PeerDiscoveryResult:
+    candidates: list[PeerCandidate]
+    source: str
+    reason: str
+
+
+class PeerProvider:
+    source_name = "unknown"
+
+    def discover(self, ticker: str, company_profile: dict) -> PeerDiscoveryResult:
+        raise NotImplementedError
+
+
+class FmpPeerProvider(BaseHttpProvider, PeerProvider):
+    source_name = "fmp"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.api_key = get_settings().fmp_api_key
+
+    def discover(self, ticker: str, company_profile: dict) -> PeerDiscoveryResult:
+        if not self.api_key:
+            return PeerDiscoveryResult(candidates=[], source=self.source_name, reason="FMP peers API unavailable")
+
+        payload = self._get_json(
+            "https://financialmodelingprep.com/stable/stock-peers",
+            params={"symbol": ticker, "apikey": self.api_key},
+        )
+        tickers = self._extract_tickers(payload)
+        return PeerDiscoveryResult(
+            candidates=[PeerCandidate(ticker=item, source=self.source_name) for item in tickers],
+            source=self.source_name,
+            reason="selected via FMP peers API and filtered by industry/market-cap similarity",
+        )
+
+    def _extract_tickers(self, payload: dict | list) -> list[str]:
+        if isinstance(payload, list):
+            values = payload
+        elif isinstance(payload, dict):
+            if isinstance(payload.get("peersList"), list):
+                values = payload["peersList"]
+            elif isinstance(payload.get("peers"), list):
+                values = payload["peers"]
+            elif isinstance(payload.get("symbolsList"), list):
+                values = payload["symbolsList"]
+            else:
+                values = []
+        else:
+            values = []
+        return [str(item).upper() for item in values if item]
+
+
+class FinnhubPeerProvider(BaseHttpProvider, PeerProvider):
+    source_name = "finnhub"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.api_key = get_settings().finnhub_api_key
+
+    def discover(self, ticker: str, company_profile: dict) -> PeerDiscoveryResult:
+        if not self.api_key:
+            return PeerDiscoveryResult(candidates=[], source=self.source_name, reason="Finnhub peers API unavailable")
+
+        payload = self._get_json(
+            "https://finnhub.io/api/v1/stock/peers",
+            params={"symbol": ticker, "token": self.api_key},
+        )
+        values = payload if isinstance(payload, list) else []
+        tickers = [str(item).upper() for item in values if item]
+        return PeerDiscoveryResult(
+            candidates=[PeerCandidate(ticker=item, source=self.source_name) for item in tickers],
+            source=self.source_name,
+            reason="selected via Finnhub fallback and local filtering",
+        )
+
+
+class ConfigPeerProvider(PeerProvider):
+    source_name = "config"
+
+    def __init__(self, peer_group_config: dict) -> None:
+        self.peer_group_config = peer_group_config
+
+    def discover(self, ticker: str, company_profile: dict) -> PeerDiscoveryResult:
+        sector = company_profile.get("sector", "")
+        industry = company_profile.get("industry", "")
+        matched_rule = None
+        for rule in self.peer_group_config["rules"]:
+            sector_match = rule["sector"] == sector
+            industry_match = any(fragment.lower() in industry.lower() for fragment in rule["industry_contains"])
+            if sector_match or industry_match:
+                matched_rule = rule
+                break
+
+        selected = matched_rule["tickers"] if matched_rule else self.peer_group_config["fallback"]["tickers"]
+        reason = (
+            "selected from local config fallback due to insufficient API peers"
+            if matched_rule
+            else "selected from broad config fallback due to insufficient API peers"
+        )
+        return PeerDiscoveryResult(
+            candidates=[PeerCandidate(ticker=item, source=self.source_name) for item in selected],
+            source=self.source_name,
+            reason=reason,
+        )
+
+
+class BusinessTypePeerProvider(PeerProvider):
+    source_name = "business_type"
+
+    def discover(self, ticker: str, company_profile: dict) -> PeerDiscoveryResult:
+        business_type = company_profile.get("business_type")
+        tickers = [item for item in get_business_type_universe(business_type) if item != ticker]
+        return PeerDiscoveryResult(
+            candidates=[PeerCandidate(ticker=item, source=self.source_name) for item in tickers],
+            source=self.source_name,
+            reason="selected via business-type fallback universe",
+        )

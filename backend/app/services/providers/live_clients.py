@@ -206,6 +206,7 @@ class SecEdgarProvider(BaseHttpProvider):
 
         payload = {
             "cik": cik,
+            "sic": str(submissions.get("sic") or ""),
             "company": submissions.get("name") or facts.get("entityName") or ticker,
             "industry": sic_description or "Unknown",
             "sector": _map_sector(sic_description),

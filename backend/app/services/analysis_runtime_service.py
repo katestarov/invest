@@ -17,13 +17,16 @@ from app.schemas.analysis import (
 )
 from app.services.analysis_safety import (
     apply_low_confidence_cap,
+    classify_company,
     coverage_ratio,
+    get_business_type_universe,
     is_bank_like_company,
     normalize_weights,
     premium_pct,
     round_or_none,
     safe_ratio,
     score_inverse,
+    score_relative_valuation,
     score_positive,
     weighted_score,
 )
@@ -34,6 +37,7 @@ from app.services.providers.live_clients import (
     YahooFinanceProvider,
     summarize_peer_averages,
 )
+from app.services.providers.peer_providers import BusinessTypePeerProvider, ConfigPeerProvider, FmpPeerProvider, FinnhubPeerProvider, PeerDiscoveryResult
 from app.utils.cache import TTLCache
 
 
@@ -46,6 +50,18 @@ class AnalysisService:
         self.world_bank = WorldBankProvider()
         self.scoring_config = get_scoring_config()
         self.peer_group_config = get_peer_group_config()
+        self.peer_target_count = settings.peer_target_count
+        self.peer_min_valid_count = settings.peer_min_valid_count
+        self.peer_providers = [
+            FmpPeerProvider(),
+            FinnhubPeerProvider(),
+            BusinessTypePeerProvider(),
+            ConfigPeerProvider(self.peer_group_config),
+        ]
+        self.peer_group_cache = TTLCache[tuple[list[dict], dict]](
+            ttl_seconds=settings.provider_cache_ttl_seconds,
+            max_items=128,
+        )
         self.analysis_cache = TTLCache[AnalysisResponse](
             ttl_seconds=settings.analysis_cache_ttl_seconds,
             max_items=128,
@@ -74,13 +90,31 @@ class AnalysisService:
             "company": yahoo_result.payload.get("company") or edgar_result.payload.get("company") or normalized_ticker,
             "sector": edgar_result.payload.get("sector", "Unknown"),
             "industry": edgar_result.payload.get("industry", "Unknown"),
+            "sic": edgar_result.payload.get("sic", ""),
         }
+        business_type, business_type_confidence, business_type_reason = classify_company(
+            ticker=normalized_ticker,
+            sector=company_profile["sector"],
+            industry=company_profile["industry"],
+            sic=company_profile["sic"],
+            company=company_profile["company"],
+        )
+        company_profile["business_type"] = business_type
+        company_profile["business_type_confidence"] = business_type_confidence
+        company_profile["business_type_reason"] = business_type_reason
         is_bank_like = self._is_bank_like(company_profile)
         macro = {**fred_result.payload, **world_bank_result.payload}
-        peers = self._build_peer_group(company_profile)
-        peer_averages = summarize_peer_averages(peers)
-        silver_metrics = self._build_silver_metrics(yahoo_result.payload, edgar_result.payload, peer_averages, is_bank_like)
-        warnings.extend(self._build_data_quality_warnings(edgar_result.payload, macro, peer_averages, is_bank_like))
+        peers, peer_selection = self._build_peer_group(company_profile, yahoo_result.payload, edgar_result.payload)
+        peer_selection["business_type_confidence"] = company_profile["business_type_confidence"]
+        peer_selection["business_type_reason"] = company_profile["business_type_reason"]
+        peer_averages = summarize_peer_averages(peers if peer_selection.get("peer_group_quality_passed", True) else [])
+        silver_metrics = self._build_silver_metrics(
+            yahoo_result.payload,
+            edgar_result.payload,
+            peer_averages | peer_selection,
+            is_bank_like,
+        )
+        warnings.extend(self._build_data_quality_warnings(edgar_result.payload, macro, peer_averages | peer_selection, is_bank_like))
         warnings.extend(self._build_completeness_warnings(silver_metrics, macro))
         weighted_scores = self._build_weighted_scores(silver_metrics, macro)
         total_score = round(sum(score * weight for score, weight, _ in weighted_scores.values()), 1)
@@ -176,42 +210,57 @@ class AnalysisService:
         finally:
             session.close()
 
-    def _build_peer_group(self, company_profile: dict) -> list[dict]:
-        sector = company_profile["sector"]
-        industry = company_profile["industry"]
-        matched_rule = None
-        for rule in self.peer_group_config["rules"]:
-            sector_match = rule["sector"] == sector
-            industry_match = any(fragment.lower() in industry.lower() for fragment in rule["industry_contains"])
-            if sector_match or industry_match:
-                matched_rule = rule
-                break
+    def _build_peer_group(self, company_profile: dict, yahoo: dict, edgar: dict) -> tuple[list[dict], dict]:
+        cache_key = f"{company_profile.get('ticker')}|{company_profile.get('sector')}|{company_profile.get('industry')}|{company_profile.get('sic')}"
+        cached = self.peer_group_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        tickers = (matched_rule or self.peer_group_config["fallback"])["tickers"][:6]
-        rows: list[dict] = []
-        for peer_ticker in tickers:
-            try:
-                yahoo_payload = self.yahoo.fetch_company_bundle(peer_ticker).payload
-                edgar_payload = self.edgar.fetch_company_bundle(peer_ticker).payload
-                rows.append(
-                    {
-                        "ticker": peer_ticker,
-                        "company": yahoo_payload.get("company") or edgar_payload.get("company") or peer_ticker,
-                        "sector": edgar_payload.get("sector", "Unknown"),
-                        "industry": edgar_payload.get("industry", "Unknown"),
-                        "market_cap_bln": self._market_cap_bln(yahoo_payload, edgar_payload),
-                        "pe_ratio": self._pe_ratio(yahoo_payload, edgar_payload),
-                        "pb_ratio": self._pb_ratio(yahoo_payload, edgar_payload),
-                        "roe_pct": self._roe_pct(edgar_payload),
-                        "revenue_growth_pct": self._revenue_growth_pct(edgar_payload),
-                        "debt_to_equity": edgar_payload["debt_to_equity"],
-                    }
-                )
-            except Exception:
+        company_market_cap = self._market_cap_bln(yahoo, edgar)
+        fallback_rows: list[dict] = []
+        fallback_meta = {
+            "peer_selection_confidence": "low",
+            "peer_selection_reason": "selected from broad config fallback due to insufficient API peers",
+            "peer_selection_source": "config",
+            "peer_group_quality_passed": False,
+            "peer_group_sample_limited": False,
+        }
+        for provider in self.peer_providers:
+            discovery = provider.discover(company_profile["ticker"], company_profile)
+            candidate_tickers = self._filter_candidate_tickers_by_business_type(
+                company_profile,
+                [candidate.ticker for candidate in discovery.candidates],
+                discovery.source,
+            )
+            if not candidate_tickers:
                 continue
-            if len(rows) >= 6:
-                break
-        return rows
+            rows = self._fetch_peer_rows(candidate_tickers, company_profile["ticker"])
+            selected_rows, selection_meta = self._select_peers_from_candidates(
+                company_profile,
+                rows,
+                company_market_cap,
+                candidate_tickers,
+            )
+            selection_meta["peer_selection_reason"] = discovery.reason
+            selection_meta["peer_selection_source"] = discovery.source
+            if selected_rows and (
+                not fallback_rows
+                or (
+                    selection_meta.get("peer_group_quality_passed", False)
+                    and not fallback_meta.get("peer_group_quality_passed", False)
+                )
+                or (
+                    selection_meta.get("peer_selection_confidence") == "medium"
+                    and fallback_meta.get("peer_selection_confidence") == "low"
+                )
+            ):
+                fallback_rows, fallback_meta = selected_rows, selection_meta
+            if self._peer_selection_is_sufficient(selected_rows, selection_meta, discovery):
+                self.peer_group_cache.set(cache_key, (selected_rows, selection_meta))
+                return selected_rows, selection_meta
+
+        self.peer_group_cache.set(cache_key, (fallback_rows, fallback_meta))
+        return fallback_rows, fallback_meta
 
     def _build_silver_metrics(self, yahoo: dict, edgar: dict, peers: dict, is_bank_like: bool = False) -> dict:
         revenue_history = edgar.get("revenue_bln", [])
@@ -258,10 +307,178 @@ class AnalysisService:
             "peer_roe_noisy": peers.get("roe_pct_baseline_noisy", True),
             "peer_growth_noisy": peers.get("revenue_growth_pct_baseline_noisy", True),
             "peer_debt_noisy": peers.get("debt_to_equity_baseline_noisy", True),
+            "peer_selection_confidence": peers.get("peer_selection_confidence", "low"),
+            "peer_selection_reason": peers.get("peer_selection_reason", "fallback"),
             "pe_premium_pct": pe_premium_pct,
             "pb_premium_pct": pb_premium_pct,
             "is_bank_like": is_bank_like,
         }
+
+    def _fetch_peer_rows(self, tickers: list[str], company_ticker: str) -> list[dict]:
+        rows: list[dict] = []
+        for peer_ticker in list(dict.fromkeys(tickers)):
+            if peer_ticker == company_ticker:
+                continue
+            try:
+                yahoo_payload = self.yahoo.fetch_company_bundle(peer_ticker).payload
+                edgar_payload = self.edgar.fetch_company_bundle(peer_ticker).payload
+                rows.append(
+                    {
+                        "ticker": peer_ticker,
+                        "company": yahoo_payload.get("company") or edgar_payload.get("company") or peer_ticker,
+                        "sector": edgar_payload.get("sector", "Unknown"),
+                        "industry": edgar_payload.get("industry", "Unknown"),
+                        "sic": edgar_payload.get("sic", ""),
+                        "market_cap_bln": self._market_cap_bln(yahoo_payload, edgar_payload),
+                        "pe_ratio": self._pe_ratio(yahoo_payload, edgar_payload),
+                        "pb_ratio": self._pb_ratio(yahoo_payload, edgar_payload),
+                        "roe_pct": self._roe_pct(edgar_payload),
+                        "revenue_growth_pct": self._revenue_growth_pct(edgar_payload),
+                        "debt_to_equity": edgar_payload.get("debt_to_equity"),
+                    }
+                )
+            except Exception:
+                continue
+        return rows
+
+    def _select_peers_from_candidates(
+        self,
+        company_profile: dict,
+        candidates: list[dict],
+        company_market_cap: float | None,
+        manual_tickers: list[str],
+    ) -> tuple[list[dict], dict]:
+        scored_manual = [
+            (self._peer_match_score(company_profile, company_market_cap, candidate), candidate)
+            for candidate in candidates
+            if candidate["ticker"] in manual_tickers
+        ]
+        manual_valid = len([1 for score, candidate in scored_manual if score > 0 and self._peer_data_quality(candidate) >= 2])
+        use_manual = manual_valid >= 3
+        scored_candidates = [
+            (self._peer_match_score(company_profile, company_market_cap, candidate), candidate)
+            for candidate in candidates
+            if self._peer_match_score(company_profile, company_market_cap, candidate) > 0
+        ]
+        ranked = sorted(scored_candidates, key=lambda item: item[0], reverse=True)
+        if use_manual:
+            ranked = sorted(scored_manual, key=lambda item: item[0], reverse=True)
+        selected = [candidate for _, candidate in ranked[: self.peer_target_count]]
+        top_score = ranked[0][0] if ranked else 0.0
+        average_score = sum(score for score, _ in ranked[: self.peer_target_count]) / max(len(selected), 1) if selected else 0.0
+        company_business_type = company_profile.get("business_type", "OTHER")
+        matching_business_types = sum(
+            1 for candidate in selected if self._candidate_business_type(candidate) == company_business_type and company_business_type != "OTHER"
+        )
+        quality_passed = bool(
+            selected
+            and average_score >= 2.0
+            and (
+                company_business_type in {"OTHER", "UNKNOWN"}
+                or matching_business_types >= max(1, len(selected) // 2)
+            )
+        )
+        sample_limited = quality_passed and len(selected) < self.peer_min_valid_count
+        confidence = "high" if len(selected) >= 5 and top_score >= 4.5 else "medium" if quality_passed and len(selected) >= 1 else "low"
+        if not quality_passed:
+            confidence = "low"
+        reason = "manual peer group" if use_manual else "auto-selected peers"
+        return selected, {
+            "peer_selection_confidence": confidence,
+            "peer_selection_reason": reason,
+            "peer_group_quality_passed": quality_passed,
+            "peer_group_sample_limited": sample_limited,
+        }
+
+    def _peer_selection_is_sufficient(
+        self,
+        selected_rows: list[dict],
+        selection_meta: dict,
+        discovery: PeerDiscoveryResult,
+    ) -> bool:
+        if len(selected_rows) < self.peer_min_valid_count:
+            return False
+        return selection_meta.get("peer_group_quality_passed", False) and selection_meta.get("peer_selection_confidence") in {"high", "medium"}
+
+    def _peer_match_score(self, company_profile: dict, company_market_cap: float | None, candidate: dict) -> float:
+        score = 0.0
+        company_sic = str(company_profile.get("sic") or "")
+        candidate_sic = str(candidate.get("sic") or "")
+        company_industry = (company_profile.get("industry") or "").lower()
+        candidate_industry = (candidate.get("industry") or "").lower()
+        company_business_type = company_profile.get("business_type", "OTHER")
+        candidate_business_type = self._candidate_business_type(candidate)
+
+        if company_business_type not in {"OTHER", "UNKNOWN"}:
+            if candidate_business_type == company_business_type:
+                score += 3.5
+            elif candidate_business_type not in {"OTHER", "UNKNOWN"}:
+                score -= 2.5
+            else:
+                score -= 0.75
+
+        if company_sic and candidate_sic:
+            if company_sic[:4] == candidate_sic[:4]:
+                score += 3.0
+            elif company_sic[:3] == candidate_sic[:3]:
+                score += 2.0
+            elif company_sic[:2] == candidate_sic[:2]:
+                score += 1.0
+
+        if company_industry and candidate_industry:
+            if company_industry in candidate_industry or candidate_industry in company_industry:
+                score += 2.0
+            elif any(token in candidate_industry for token in company_industry.split() if len(token) > 4):
+                score += 1.0
+
+        if company_profile.get("sector") == candidate.get("sector"):
+            score += 1.0
+
+        candidate_market_cap = candidate.get("market_cap_bln")
+        if company_market_cap and candidate_market_cap and company_market_cap > 0 and candidate_market_cap > 0:
+            distance = abs(company_market_cap - candidate_market_cap) / max(company_market_cap, candidate_market_cap)
+            score -= min(distance, 1.5)
+
+        score -= max(0, 4 - self._peer_data_quality(candidate)) * 0.35
+        if candidate.get("pe_ratio") is not None and candidate["pe_ratio"] > 120:
+            score -= 0.6
+        if candidate.get("pb_ratio") is not None and candidate["pb_ratio"] > 25:
+            score -= 0.4
+        return score
+
+    def _candidate_business_type(self, candidate: dict) -> str:
+        business_type, _, _ = classify_company(
+            ticker=candidate.get("ticker"),
+            sector=candidate.get("sector"),
+            industry=candidate.get("industry"),
+            sic=candidate.get("sic"),
+            company=candidate.get("company"),
+        )
+        return business_type
+
+    def _filter_candidate_tickers_by_business_type(
+        self,
+        company_profile: dict,
+        candidate_tickers: list[str],
+        source: str,
+    ) -> list[str]:
+        unique = [ticker for ticker in list(dict.fromkeys(candidate_tickers)) if ticker != company_profile.get("ticker")]
+        business_universe = get_business_type_universe(company_profile.get("business_type"))
+        if not business_universe:
+            return unique
+        if source in {"fmp", "finnhub", "config"}:
+            matching = [ticker for ticker in unique if ticker in business_universe]
+            if matching:
+                return matching
+            return [] if source in {"fmp", "finnhub"} else unique
+        return [ticker for ticker in unique if ticker in business_universe]
+
+    def _peer_data_quality(self, candidate: dict) -> int:
+        return sum(
+            1
+            for key in ("pe_ratio", "pb_ratio", "roe_pct", "revenue_growth_pct", "debt_to_equity")
+            if candidate.get(key) is not None
+        )
 
     def _market_cap_bln(self, yahoo: dict, edgar: dict) -> float | None:
         price = yahoo.get("current_price")
@@ -306,8 +523,8 @@ class AnalysisService:
             (score_positive(metrics["fcf_margin_pct"], caps["fcf_margin_pct"]), 0.25),
         ]
         valuation_components = [
-            (score_inverse(max(metrics["pe_premium_pct"], 0.0) if metrics["pe_premium_pct"] is not None else None, caps["pe_premium_pct"]), 0.55),
-            (score_inverse(max(metrics["pb_premium_pct"], 0.0) if metrics["pb_premium_pct"] is not None else None, caps["pb_premium_pct"]), 0.45),
+            (score_relative_valuation(metrics["pe_premium_pct"], caps["pe_premium_pct"]), 0.55),
+            (score_relative_valuation(metrics["pb_premium_pct"], caps["pb_premium_pct"]), 0.45),
         ]
         growth_components = [
             (score_positive(metrics["revenue_growth_pct"], caps["revenue_growth_pct"]), 0.55),
@@ -372,7 +589,7 @@ class AnalysisService:
                     peers["pe_ratio"],
                     "lower_better",
                     metrics.get("peer_pe_valid_count", 3),
-                    bool(metrics.get("peer_pe_noisy", False)),
+                    bool(metrics.get("peer_pe_noisy", False)) or metrics.get("peer_selection_confidence") == "low",
                 ),
                 description="Меньшее значение обычно означает более умеренную оценку относительно прибыли.",
             ),
@@ -389,7 +606,7 @@ class AnalysisService:
                     peers["roe_pct"],
                     "higher_better",
                     metrics.get("peer_roe_valid_count", 3),
-                    bool(metrics.get("peer_roe_noisy", False)),
+                    bool(metrics.get("peer_roe_noisy", False)) or metrics.get("peer_selection_confidence") == "low",
                 ),
                 description="Показывает, насколько эффективно компания генерирует прибыль на капитал акционеров.",
             ),
@@ -406,7 +623,7 @@ class AnalysisService:
                     peers["revenue_growth_pct"],
                     "higher_better",
                     metrics.get("peer_growth_valid_count", 3),
-                    bool(metrics.get("peer_growth_noisy", False)),
+                    bool(metrics.get("peer_growth_noisy", False)) or metrics.get("peer_selection_confidence") == "low",
                 ),
                 description="Сравнение темпа роста выручки с компаниями того же сектора.",
             ),
@@ -422,7 +639,7 @@ class AnalysisService:
                     peers["debt_to_equity"],
                     "lower_better",
                     metrics.get("peer_debt_valid_count", 3),
-                    bool(metrics.get("peer_debt_noisy", False)) or bool(metrics.get("is_bank_like")),
+                    bool(metrics.get("peer_debt_noisy", False)) or bool(metrics.get("is_bank_like")) or metrics.get("peer_selection_confidence") == "low",
                 ),
                 description="Показывает, насколько агрессивно бизнес финансируется долгом.",
             ),
@@ -527,6 +744,25 @@ class AnalysisService:
             warnings.append("Peer baseline is sparse or affected by outliers; comparative valuation may be noisy")
         if any(peers.get(key, False) for key in ("pe_ratio_baseline_noisy", "pb_ratio_baseline_noisy")):
             warnings.append("Low-confidence valuation comparison: peer baseline is noisy")
+        if peers.get("peer_selection_confidence") == "low":
+            warnings.append("Peer baseline is noisy or based on fallback selection")
+            warnings.append("Low-confidence peer comparison")
+        if peers.get("peer_group_sample_limited"):
+            warnings.append("Peer comparison based on limited peer set")
+            warnings.append("Peer averages computed from small sample size")
+        if peers.get("peer_selection_source") == "business_type":
+            warnings.append("Peer selection used business-type fallback universe")
+        if peers.get("peer_selection_source") in {"fmp", "finnhub"}:
+            warnings.append("Peers were selected via external API and filtered locally")
+        if peers.get("peer_selection_source") == "config":
+            warnings.append("Peer baseline used fallback source due to insufficient API peers")
+            if peers.get("peer_selection_confidence") == "low":
+                warnings.append("Peer selection used broad fallback because no reliable API peers were found")
+        if peers.get("peer_group_quality_passed") is False:
+            warnings.append("No reliable peers found within inferred business type")
+            warnings.append("Comparative metrics were downgraded due to weak peer relevance")
+            if peers.get("peer_selection_source") == "config":
+                warnings.append("Broad fallback peers were rejected for scoring use")
         if any(
             peers.get(key, 0) == 0
             for key in ("pe_ratio_valid_count", "pb_ratio_valid_count", "roe_pct_valid_count", "debt_to_equity_valid_count")
@@ -534,6 +770,8 @@ class AnalysisService:
             warnings.append("Some peer metrics were excluded due to invalid or non-interpretable values")
         if is_bank_like:
             warnings.append("Bank-specific scoring rules were applied; some generic corporate metrics were excluded")
+        if peers.get("business_type_confidence") in {"medium", "low"}:
+            warnings.append("Business type was inferred from rule-based classification")
         return warnings
 
     def _is_bank_like(self, company_profile: dict) -> bool:
