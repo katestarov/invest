@@ -34,10 +34,57 @@ def _series_latest(entries: list[dict]) -> float:
     return _safe_number(ordered[-1].get("val"))
 
 
+def _parse_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def _is_annual_period(item: dict) -> bool:
+    form = str(item.get("form") or "").upper()
+    fp = str(item.get("fp") or "").upper()
+    start_date = _parse_date(item.get("start"))
+    end_date = _parse_date(item.get("end"))
+    if form not in {"10-K", "20-F", "10-K/A", "20-F/A", "40-F", "40-F/A"}:
+        return False
+    if fp == "FY":
+        return True
+    if start_date and end_date:
+        duration_days = (end_date - start_date).days
+        return 330 <= duration_days <= 380
+    return False
+
+
 def _series_annual(entries: list[dict], limit: int = 4) -> list[dict]:
-    annual = [item for item in entries if item.get("form") in {"10-K", "20-F", "10-K/A"}]
-    ordered = sorted(annual, key=lambda item: item.get("fy") or item.get("end") or "", reverse=True)
+    annual = [item for item in entries if _is_annual_period(item)]
+    deduped: dict[str, dict] = {}
+    for item in annual:
+        dedupe_key = f"{item.get('fy') or ''}|{item.get('end') or ''}"
+        current = deduped.get(dedupe_key)
+        if current is None:
+            deduped[dedupe_key] = item
+            continue
+        current_filed = _parse_date(current.get("filed"))
+        item_filed = _parse_date(item.get("filed"))
+        if item_filed and (current_filed is None or item_filed > current_filed):
+            deduped[dedupe_key] = item
+    ordered = sorted(
+        deduped.values(),
+        key=lambda item: (_parse_date(item.get("end")) or datetime.min, str(item.get("fy") or "")),
+        reverse=True,
+    )
     return ordered[:limit]
+
+
+def _first_series(facts: dict, taxonomy: str, concepts: list[str], unit: str = "USD") -> list[dict]:
+    for concept in concepts:
+        series = facts.get("facts", {}).get(taxonomy, {}).get(concept, {}).get("units", {}).get(unit, [])
+        if series:
+            return series
+    return []
 
 
 def _map_sector(sic_description: str) -> str:
@@ -154,30 +201,103 @@ class SecEdgarProvider(BaseHttpProvider):
                 return f"{int(item['cik_str']):010d}"
         raise KeyError(f"SEC не нашёл CIK для тикера {normalized}.")
 
-    def _fact_series(self, facts: dict, taxonomy: str, concept: str) -> list[dict]:
-        return facts.get("facts", {}).get(taxonomy, {}).get(concept, {}).get("units", {}).get("USD", [])
-
     def fetch_company_bundle(self, ticker: str) -> ProviderResult:
         cik = self._ticker_to_cik(ticker)
         facts = self._get_json(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
         submissions = self._get_json(f"https://data.sec.gov/submissions/CIK{cik}.json")
 
         revenue_series = _series_annual(
-            self._fact_series(facts, "us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax")
-            or self._fact_series(facts, "us-gaap", "Revenues")
+            _first_series(
+                facts,
+                "us-gaap",
+                [
+                    "RevenueFromContractWithCustomerExcludingAssessedTax",
+                    "SalesRevenueNet",
+                    "RevenueFromContractWithCustomerIncludingAssessedTax",
+                    "Revenues",
+                ],
+            )
         )
-        cfo_series = _series_annual(self._fact_series(facts, "us-gaap", "NetCashProvidedByUsedInOperatingActivities"))
+        cfo_series = _series_annual(
+            _first_series(
+                facts,
+                "us-gaap",
+                [
+                    "NetCashProvidedByUsedInOperatingActivities",
+                    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+                ],
+            )
+        )
         capex_series = _series_annual(
-            self._fact_series(facts, "us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment")
-            or self._fact_series(facts, "us-gaap", "CapitalExpendituresIncurredButNotYetPaid")
+            _first_series(
+                facts,
+                "us-gaap",
+                [
+                    "PaymentsToAcquirePropertyPlantAndEquipment",
+                    "CapitalExpendituresIncurredButNotYetPaid",
+                    "PropertyPlantAndEquipmentAdditions",
+                ],
+            )
         )
-        equity_series = _series_annual(self._fact_series(facts, "us-gaap", "StockholdersEquity"))
-        current_assets_series = _series_annual(self._fact_series(facts, "us-gaap", "AssetsCurrent"))
-        current_liabilities_series = _series_annual(self._fact_series(facts, "us-gaap", "LiabilitiesCurrent"))
-        liabilities_series = _series_annual(self._fact_series(facts, "us-gaap", "Liabilities"))
-        assets_series = _series_annual(self._fact_series(facts, "us-gaap", "Assets"))
-        operating_income_series = _series_annual(self._fact_series(facts, "us-gaap", "OperatingIncomeLoss"))
-        net_income_series = _series_annual(self._fact_series(facts, "us-gaap", "NetIncomeLoss"))
+        equity_series = _series_annual(
+            _first_series(
+                facts,
+                "us-gaap",
+                [
+                    "StockholdersEquity",
+                    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+                    "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest",
+                ],
+            )
+        )
+        current_assets_series = _series_annual(_first_series(facts, "us-gaap", ["AssetsCurrent"]))
+        current_liabilities_series = _series_annual(_first_series(facts, "us-gaap", ["LiabilitiesCurrent"]))
+        liabilities_series = _series_annual(
+            _first_series(
+                facts,
+                "us-gaap",
+                [
+                    "Liabilities",
+                    "LiabilitiesFairValueDisclosure",
+                ],
+            )
+        )
+        debt_series = _series_annual(
+            _first_series(
+                facts,
+                "us-gaap",
+                [
+                    "LongTermDebtAndFinanceLeaseObligations",
+                    "LongTermDebtNoncurrent",
+                    "LongTermDebt",
+                ],
+            )
+        )
+        current_debt_series = _series_annual(
+            _first_series(
+                facts,
+                "us-gaap",
+                [
+                    "LongTermDebtCurrent",
+                    "ShortTermBorrowings",
+                    "ShortTermDebt",
+                    "CommercialPaper",
+                ],
+            )
+        )
+        assets_series = _series_annual(_first_series(facts, "us-gaap", ["Assets"]))
+        operating_income_series = _series_annual(_first_series(facts, "us-gaap", ["OperatingIncomeLoss"]))
+        net_income_series = _series_annual(
+            _first_series(
+                facts,
+                "us-gaap",
+                [
+                    "NetIncomeLoss",
+                    "ProfitLoss",
+                    "NetIncomeLossAvailableToCommonStockholdersBasic",
+                ],
+            )
+        )
         shares_series = _series_annual(
             facts.get("facts", {}).get("dei", {}).get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
         )
@@ -189,6 +309,8 @@ class SecEdgarProvider(BaseHttpProvider):
         latest_equity = _series_latest(equity_series)
         latest_assets = _series_latest(assets_series)
         latest_liabilities = _series_latest(liabilities_series)
+        latest_debt = _series_latest(debt_series)
+        latest_current_debt = _series_latest(current_debt_series)
         latest_current_assets = _series_latest(current_assets_series)
         latest_current_liabilities = _series_latest(current_liabilities_series)
         latest_operating_income = _series_latest(operating_income_series)
@@ -199,10 +321,23 @@ class SecEdgarProvider(BaseHttpProvider):
         latest_revenue = revenues[0] if revenues else 0.0
         latest_fcf = fcf[0] if fcf else 0.0
         current_ratio = safe_ratio(latest_current_assets, latest_current_liabilities)
-        debt_to_equity = safe_ratio(max(latest_liabilities - latest_equity, 0), latest_equity)
+        total_debt = latest_debt + latest_current_debt
+        fallback_debt = max(latest_liabilities - latest_equity, 0)
+        debt_base = total_debt if total_debt > 0 else fallback_debt
+        debt_to_equity = safe_ratio(debt_base, latest_equity)
         roic_pct = safe_ratio(latest_operating_income, latest_equity)
         ebit_margin_pct = safe_ratio(latest_operating_income, latest_revenue * 1_000_000_000 if latest_revenue else None)
         fcf_margin_pct = safe_ratio(latest_fcf, latest_revenue)
+        revenue_periods = [
+            {
+                "fy": str(item.get("fy") or ""),
+                "end": str(item.get("end") or ""),
+                "period_type": "annual",
+                "fiscal_period": str(item.get("fp") or ""),
+                "form": str(item.get("form") or ""),
+            }
+            for item in revenue_series
+        ]
 
         payload = {
             "cik": cik,
@@ -229,6 +364,7 @@ class SecEdgarProvider(BaseHttpProvider):
             ],
             "assets_bln": round(latest_assets / 1_000_000_000, 2),
             "equity_bln": round(latest_equity / 1_000_000_000, 2),
+            "revenue_periods": revenue_periods,
         }
         warnings: list[str] = []
         if not revenues:

@@ -151,12 +151,12 @@ _BUSINESS_TYPE_UNIVERSES: dict[str, list[str]] = {
     "SEMICONDUCTORS": ["NVDA", "AMD", "AVGO", "QCOM", "INTC", "TSM", "TXN"],
     "SOFTWARE": ["MSFT", "ORCL", "CRM", "NOW", "ADBE", "SAP"],
     "ENTERPRISE_SOFTWARE": ["MSFT", "ORCL", "CRM", "NOW", "SAP", "ADBE"],
-    "CONSUMER_HARDWARE_ECOSYSTEM": ["AAPL", "HPQ", "DELL", "SONY", "SMSN", "MSFT"],
-    "INTERNET_PLATFORM": ["UBER", "ABNB", "DASH", "LYFT", "BKNG", "EXPE"],
+    "CONSUMER_HARDWARE_ECOSYSTEM": ["AAPL", "DELL", "HPQ", "SONY", "SMSN", "MSFT"],
+    "INTERNET_PLATFORM": ["UBER", "ABNB", "DASH", "LYFT", "BKNG", "EXPE", "META", "GOOGL"],
     "E_COMMERCE": ["AMZN", "EBAY", "ETSY", "MELI", "SHOP", "BABA"],
     "RESTAURANTS": ["SBUX", "MCD", "YUM", "CMG", "QSR", "DRI"],
     "RETAIL": ["HD", "LOW", "TJX", "TGT", "COST", "WMT"],
-    "HOME_IMPROVEMENT_RETAIL": ["HD", "LOW"],
+    "HOME_IMPROVEMENT_RETAIL": ["HD", "LOW", "FLOOR"],
     "OIL_GAS": ["XOM", "CVX", "COP", "EOG", "OXY", "SLB"],
     "MINING": ["NEM", "FCX", "RIO", "BHP", "SCCO", "TECK"],
     "REIT": ["O", "PLD", "SPG", "PSA", "WELL", "EQIX"],
@@ -187,6 +187,8 @@ def classify_company(
         "LYFT": "INTERNET_PLATFORM",
         "V": "PAYMENTS",
         "MA": "PAYMENTS",
+        "AXP": "PAYMENTS",
+        "PYPL": "PAYMENTS",
         "BLK": "ASSET_MANAGER",
         "O": "REIT",
         "AAPL": "CONSUMER_HARDWARE_ECOSYSTEM",
@@ -199,7 +201,7 @@ def classify_company(
         ("BANK", ("bank", "banc", "commercial bank", "regional bank", "savings bank")),
         ("INSURANCE", ("insurance", "insurer", "property casualty", "life insurance")),
         ("ASSET_MANAGER", ("asset management", "wealth management", "investment management", "private equity")),
-        ("PAYMENTS", ("payment", "payments", "card network", "merchant acquiring", "digital wallet")),
+        ("PAYMENTS", ("payment", "payments", "card network", "merchant acquiring", "digital wallet", "credit services", "card issuer", "merchant services")),
         ("SEMICONDUCTORS", ("semiconductor", "chip", "gpu", "microprocessor")),
         ("ENTERPRISE_SOFTWARE", ("enterprise software", "enterprise application", "crm", "erp", "workflow automation")),
         ("CONSUMER_HARDWARE_ECOSYSTEM", ("consumer electronics", "smartphone", "personal computer", "computer hardware", "hardware ecosystem")),
@@ -240,3 +242,38 @@ def classify_company(
 
 def get_business_type_universe(business_type: str | None) -> list[str]:
     return list(_BUSINESS_TYPE_UNIVERSES.get((business_type or "").upper(), []))
+
+
+_COMPATIBILITY_RULES: dict[str, dict[str, tuple[str, ...]]] = {
+    "BANK": {"STRICT": ("BANK",), "RELATED": ("PAYMENTS",), "WEAK": ("ASSET_MANAGER",)},
+    "INSURANCE": {"STRICT": ("INSURANCE",), "WEAK": ("ASSET_MANAGER",)},
+    "ASSET_MANAGER": {"STRICT": ("ASSET_MANAGER",), "RELATED": ("PAYMENTS",), "WEAK": ("BANK", "INSURANCE")},
+    "PAYMENTS": {"STRICT": ("PAYMENTS",), "RELATED": ("INTERNET_PLATFORM",), "WEAK": ("BANK", "ASSET_MANAGER")},
+    "SEMICONDUCTORS": {"STRICT": ("SEMICONDUCTORS",), "RELATED": ("CONSUMER_HARDWARE_ECOSYSTEM",), "WEAK": ("ENTERPRISE_SOFTWARE",)},
+    "SOFTWARE": {"STRICT": ("SOFTWARE", "ENTERPRISE_SOFTWARE"), "RELATED": ("INTERNET_PLATFORM",), "WEAK": ("CONSUMER_HARDWARE_ECOSYSTEM",)},
+    "ENTERPRISE_SOFTWARE": {"STRICT": ("ENTERPRISE_SOFTWARE", "SOFTWARE"), "RELATED": ("INTERNET_PLATFORM",), "WEAK": ("CONSUMER_HARDWARE_ECOSYSTEM",)},
+    "INTERNET_PLATFORM": {"STRICT": ("INTERNET_PLATFORM",), "RELATED": ("E_COMMERCE",), "WEAK": ("ENTERPRISE_SOFTWARE", "PAYMENTS")},
+    "E_COMMERCE": {"STRICT": ("E_COMMERCE",), "RELATED": ("INTERNET_PLATFORM", "RETAIL"), "WEAK": ("PAYMENTS",)},
+    "CONSUMER_HARDWARE_ECOSYSTEM": {"STRICT": ("CONSUMER_HARDWARE_ECOSYSTEM",), "RELATED": ("SEMICONDUCTORS",), "WEAK": ("ENTERPRISE_SOFTWARE",)},
+    "RESTAURANTS": {"STRICT": ("RESTAURANTS",), "WEAK": ("RETAIL",)},
+    "RETAIL": {"STRICT": ("RETAIL",), "RELATED": ("E_COMMERCE",), "WEAK": ("HOME_IMPROVEMENT_RETAIL",)},
+    "HOME_IMPROVEMENT_RETAIL": {"STRICT": ("HOME_IMPROVEMENT_RETAIL",), "RELATED": ("RETAIL",), "WEAK": ("INDUSTRIALS",)},
+    "OIL_GAS": {"STRICT": ("OIL_GAS",), "WEAK": ("INDUSTRIALS",)},
+    "REIT": {"STRICT": ("REIT",)},
+    "HEALTHCARE": {"STRICT": ("HEALTHCARE",), "RELATED": ("PHARMA",)},
+    "PHARMA": {"STRICT": ("PHARMA",), "RELATED": ("HEALTHCARE",)},
+    "INDUSTRIALS": {"STRICT": ("INDUSTRIALS",), "WEAK": ("HOME_IMPROVEMENT_RETAIL",)},
+}
+
+
+def business_type_compatibility(base_type: str | None, candidate_type: str | None) -> str:
+    base = (base_type or "UNKNOWN").upper()
+    candidate = (candidate_type or "UNKNOWN").upper()
+    if base in {"OTHER", "UNKNOWN"} or candidate in {"OTHER", "UNKNOWN"}:
+        return "WEAK" if base == candidate and base != "UNKNOWN" else "REJECT"
+
+    rules = _COMPATIBILITY_RULES.get(base, {})
+    for level in ("STRICT", "RELATED", "WEAK"):
+        if candidate in rules.get(level, ()):
+            return level
+    return "REJECT"

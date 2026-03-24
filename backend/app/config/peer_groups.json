@@ -1,6 +1,24 @@
 {
   "rules": [
     {
+      "name": "mega-cap-tech",
+      "sector": "Technology",
+      "industry_contains": ["Infrastructure", "Consumer Electronics", "Internet Content", "E-Commerce", "Semiconductor"],
+      "tickers": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "ORCL", "CRM", "ADBE", "SAP"]
+    },
+    {
+      "name": "payments-core",
+      "sector": "Financial Services",
+      "industry_contains": ["Credit Services", "Payment", "Payments", "Card", "Consumer Finance"],
+      "tickers": ["V", "MA", "AXP", "PYPL", "FI", "GPN", "COF", "DFS"]
+    },
+    {
+      "name": "banks-core",
+      "sector": "Financial Services",
+      "industry_contains": ["Bank", "Banks", "Commercial Bank", "Regional Bank"],
+      "tickers": ["JPM", "BAC", "WFC", "C", "USB", "PNC", "GS", "MS"]
+    },
+    {
       "name": "technology-core",
       "sector": "Technology",
       "industry_contains": ["Software", "Semiconductor", "Consumer Electronics", "Internet"],
@@ -9,8 +27,8 @@
     {
       "name": "financials-core",
       "sector": "Financial Services",
-      "industry_contains": ["Bank", "Asset Management", "Insurance"],
-      "tickers": ["JPM", "BAC", "WFC", "GS", "MS", "BLK", "SCHW", "C", "AXP"]
+      "industry_contains": ["Asset Management", "Insurance", "Financial"],
+      "tickers": ["JPM", "BAC", "WFC", "GS", "MS", "BLK", "SCHW", "C", "PGR"]
     },
     {
       "name": "healthcare-core",
@@ -28,7 +46,7 @@
       "name": "industrial-core",
       "sector": "Industrials",
       "industry_contains": ["Aerospace", "Industrial", "Rail", "Machinery"],
-      "tickers": ["GE", "CAT", "DE", "RTX", "HON", "UNP", "LMT", "UPS"]
+      "tickers": ["CAT", "DE", "ETN", "HON", "EMR", "PCAR", "CMI", "GE"]
     },
     {
       "name": "consumer-cyclical-core",
