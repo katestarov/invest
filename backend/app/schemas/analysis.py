@@ -28,9 +28,11 @@ class PeerRow(BaseModel):
     industry: str
     score: float = Field(ge=0, le=100)
     market_cap_bln: float | None
+    market_cap_status: str = "valid"
     pe_ratio: float | None
     roe_pct: float | None
     revenue_growth_pct: float | None
+    quality_class: str = "usable"
 
 
 class FundamentalTrendPoint(BaseModel):

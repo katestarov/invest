@@ -43,7 +43,7 @@ from app.schemas.analysis import AnalysisResponse
 from app.services.analysis_runtime_service import AnalysisService
 from app.services.analysis_safety import business_type_compatibility, classify_company, is_bank_like_company, normalize_weights, safe_ratio
 from app.services.providers.live_clients import BaseHttpProvider, SecEdgarProvider, _safe_number, _series_latest, summarize_peer_averages
-from app.services.providers.peer_providers import PeerCandidate, PeerDiscoveryResult
+from app.services.providers.peer_providers import ConfigPeerProvider, PeerCandidate, PeerDiscoveryResult
 
 
 class ScoringSafetyTests(unittest.TestCase):
@@ -71,6 +71,7 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertEqual(classify_company(ticker="MSFT", sector="Technology", industry="Software - Infrastructure")[0], "ENTERPRISE_SOFTWARE")
         self.assertEqual(classify_company(ticker="SBUX", sector="Consumer Cyclical", industry="Restaurants")[0], "RESTAURANTS")
         self.assertEqual(classify_company(ticker="HD", sector="Consumer Cyclical", industry="Home Improvement Retail")[0], "HOME_IMPROVEMENT_RETAIL")
+        self.assertEqual(classify_company(ticker="TSLA", sector="Unknown", industry="Unknown")[0], "AUTO_MANUFACTURER")
         self.assertEqual(classify_company(ticker="CVX", sector="Energy", industry="Oil & Gas Integrated")[0], "OIL_GAS")
         self.assertEqual(classify_company(ticker="O", sector="Real Estate", industry="Real Estate Investment Trust")[0], "REIT")
 
@@ -409,6 +410,64 @@ class ScoringSafetyTests(unittest.TestCase):
             False,
         )
         self.assertIn("Negative equity detected: ROE, Debt/Equity and P/B may be unreliable", warnings)
+
+    def test_market_cap_prefers_quote_fallback_when_sec_shares_look_adr_adjusted(self) -> None:
+        diagnostics = self.service._market_cap_diagnostics(
+            {
+                "current_price": 180.0,
+                "currency": "USD",
+                "market_cap_bln_quote": 1800.0,
+                "market_cap_quote_currency": "USD",
+                "shares_outstanding_quote_mln": 10000.0,
+                "quote_type": "ADR",
+            },
+            {
+                "shares_outstanding_mln": 50025.67,
+            },
+        )
+
+        self.assertEqual(diagnostics["market_cap_bln"], 1800.0)
+        self.assertEqual(diagnostics["source"], "median_of_sources")
+        self.assertTrue(diagnostics["suspect"])
+        self.assertEqual(diagnostics["status"], "suspect")
+        self.assertIn("disagree materially", diagnostics["warning"])
+
+    def test_market_cap_uses_quote_path_for_foreign_listing_when_quote_is_usd(self) -> None:
+        diagnostics = self.service._market_cap_diagnostics(
+            {
+                "current_price": 950.0,
+                "currency": "TWD",
+                "market_cap_bln_quote": 910.0,
+                "market_cap_quote_currency": "USD",
+                "quote_type": "ADR",
+            },
+            {
+                "shares_outstanding_mln": 26000.0,
+            },
+        )
+
+        self.assertEqual(diagnostics["market_cap_bln"], 910.0)
+        self.assertEqual(diagnostics["source"], "yahoo_quote")
+        self.assertFalse(diagnostics["suspect"])
+        self.assertEqual(diagnostics["status"], "valid")
+        self.assertIn("quote-based USD fallback", diagnostics["warning"])
+
+    def test_market_cap_without_usd_conversion_path_is_excluded(self) -> None:
+        diagnostics = self.service._market_cap_diagnostics(
+            {
+                "current_price": 950.0,
+                "currency": "TWD",
+                "market_cap_bln_quote": None,
+            },
+            {
+                "shares_outstanding_mln": 26000.0,
+            },
+        )
+
+        self.assertIsNone(diagnostics["market_cap_bln"])
+        self.assertFalse(diagnostics["suspect"])
+        self.assertEqual(diagnostics["status"], "invalid")
+        self.assertIn("USD conversion path", diagnostics["warning"])
 
     def test_missing_fred_does_not_turn_into_zero_macro_bonus(self) -> None:
         weighted_scores = self.service._build_weighted_scores(
@@ -892,6 +951,26 @@ class ScoringSafetyTests(unittest.TestCase):
 
         self.assertTrue(any("Peer low confidence:" in warning for warning in warnings))
         self.assertIn("Usable peer set too small (<3); valuation was disabled", warnings)
+        self.assertIn("Valuation skipped due to insufficient comparable peers", warnings)
+
+    def test_peer_market_cap_warning_is_emitted(self) -> None:
+        warnings = self.service._build_data_quality_warnings(
+            {"equity_bln": 10.0},
+            {"fed_funds_rate_pct": 4.0, "inflation_pct": 3.0, "unemployment_pct": 4.0},
+            {
+                "pe_ratio_valid_count": 3,
+                "pb_ratio_valid_count": 3,
+                "roe_pct_valid_count": 3,
+                "revenue_growth_pct_valid_count": 3,
+                "debt_to_equity_valid_count": 3,
+                "pe_ratio_baseline_noisy": False,
+                "pb_ratio_baseline_noisy": False,
+                "market_cap_warning_count": 1,
+            },
+            False,
+        )
+
+        self.assertIn("Peer market cap normalization used fallback or excluded suspect values from size-based ranking", warnings)
 
     def test_expansion_and_partial_universe_warnings_are_emitted(self) -> None:
         warnings = self.service._build_data_quality_warnings(
@@ -944,6 +1023,82 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertEqual([row["ticker"] for row in selected[:2]], ["SPG", "PLD"])
         self.assertFalse(meta["peer_group_quality_passed"])
         self.assertLess(meta["peer_count_usable"], 3)
+
+    def test_config_provider_skips_broad_fallback_when_safe_business_universe_exists(self) -> None:
+        provider = ConfigPeerProvider(
+            {
+                "rules": [],
+                "fallback": {"tickers": ["CENN", "SEV", "FFAI", "XOM"]},
+            }
+        )
+
+        result = provider.discover(
+            "TSLA",
+            {
+                "ticker": "TSLA",
+                "sector": "Unknown",
+                "industry": "Unknown",
+                "business_type": "AUTO_MANUFACTURER",
+            },
+        )
+
+        self.assertEqual(result.candidates, [])
+        self.assertIn("business-type-safe universe", result.reason)
+
+    def test_tsla_rule_based_fallback_keeps_large_auto_peers_and_excludes_junk(self) -> None:
+        selected, meta = self.service._select_peers_from_candidates(
+            {
+                "ticker": "TSLA",
+                "sector": "Consumer Cyclical",
+                "industry": "Automobiles",
+                "sic": "",
+                "business_type": "AUTO_MANUFACTURER",
+            },
+            [
+                {"ticker": "GM", "sector": "Consumer Cyclical", "industry": "Automobiles", "sic": "3711", "market_cap_bln": 55.0, "pe_ratio": 6.0, "pb_ratio": 0.8, "roe_pct": 14.0, "revenue_growth_pct": 4.0, "debt_to_equity": 1.7},
+                {"ticker": "F", "sector": "Consumer Cyclical", "industry": "Automobiles", "sic": "3711", "market_cap_bln": 52.0, "pe_ratio": 7.0, "pb_ratio": 1.1, "roe_pct": 16.0, "revenue_growth_pct": 5.0, "debt_to_equity": 2.0},
+                {"ticker": "TM", "sector": "Consumer Cyclical", "industry": "Auto Manufacturers", "sic": "3711", "market_cap_bln": 310.0, "pe_ratio": 10.0, "pb_ratio": 1.3, "roe_pct": 11.0, "revenue_growth_pct": 7.0, "debt_to_equity": 1.1},
+                {"ticker": "RIVN", "sector": "Consumer Cyclical", "industry": "Automobiles", "sic": "3711", "market_cap_bln": 13.0, "pe_ratio": None, "pb_ratio": 2.5, "roe_pct": None, "revenue_growth_pct": 18.0, "debt_to_equity": 0.4},
+                {"ticker": "CENN", "sector": "Consumer Cyclical", "industry": "Automobiles", "sic": "3711", "market_cap_bln": 0.08, "pe_ratio": None, "pb_ratio": None, "roe_pct": None, "revenue_growth_pct": None, "debt_to_equity": None},
+                {"ticker": "SEV", "sector": "Consumer Cyclical", "industry": "Automobiles", "sic": "3711", "market_cap_bln": 0.4, "pe_ratio": None, "pb_ratio": None, "roe_pct": None, "revenue_growth_pct": 2.0, "debt_to_equity": None},
+                {"ticker": "FFAI", "sector": "Unknown", "industry": "Unknown", "sic": "", "market_cap_bln": 0.03, "pe_ratio": None, "pb_ratio": None, "roe_pct": None, "revenue_growth_pct": None, "debt_to_equity": None},
+            ],
+            700.0,
+            ["GM", "F", "TM", "RIVN", "CENN", "SEV", "FFAI"],
+        )
+
+        selected_tickers = [row["ticker"] for row in selected]
+        self.assertIn("GM", selected_tickers)
+        self.assertIn("F", selected_tickers)
+        self.assertIn("TM", selected_tickers)
+        self.assertNotIn("CENN", selected_tickers)
+        self.assertNotIn("SEV", selected_tickers)
+        self.assertNotIn("FFAI", selected_tickers)
+        self.assertGreaterEqual(meta["peer_count_usable"], 3)
+
+    def test_tsla_valuation_stays_disabled_when_clean_comparable_set_is_below_three(self) -> None:
+        metrics = self.service._build_silver_metrics(
+            {"current_price": 200.0, "one_year_return_pct": 12.0, "five_year_return_pct": 80.0},
+            {
+                "revenue_bln": [95.0, 82.0, 60.0],
+                "net_income_bln": 12.0,
+                "equity_bln": 68.0,
+                "shares_outstanding_mln": 3200.0,
+            },
+            {
+                "pe_ratio": 12.0,
+                "pb_ratio": 4.0,
+                "roe_pct": 14.0,
+                "revenue_growth_pct": 8.0,
+                "debt_to_equity": 1.0,
+                "pe_ratio_valid_count": 2,
+                "pb_ratio_valid_count": 2,
+                "peer_count_usable": 2,
+                "peer_selection_confidence": "medium",
+            },
+        )
+
+        self.assertFalse(metrics["valuation_enabled"])
 
     def test_restaurants_do_not_take_retail_as_strict_peers(self) -> None:
         selected, meta = self.service._select_peers_from_candidates(
@@ -1235,6 +1390,28 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertEqual(peer_averages["peer_baseline_reliability"], "low")
         self.assertIsNone(peer_averages["pe_ratio"])
 
+    def test_peer_averages_exclude_rows_with_untrusted_market_cap(self) -> None:
+        peer_averages = self.service._build_peer_averages(
+            [
+                {"ticker": "MSFT", "sector": "Technology", "industry": "Software - Infrastructure", "market_cap_bln": 3100.0, "pe_ratio": 30.0, "pb_ratio": 10.0, "roe_pct": 35.0, "revenue_growth_pct": 12.0, "debt_to_equity": 0.4},
+                {"ticker": "ORCL", "sector": "Technology", "industry": "Software - Infrastructure", "market_cap_bln": 380.0, "pe_ratio": 20.0, "pb_ratio": 8.0, "roe_pct": 28.0, "revenue_growth_pct": 9.0, "debt_to_equity": 1.7},
+                {"ticker": "ADBE", "sector": "Technology", "industry": "Software - Infrastructure", "market_cap_bln": 220.0, "pe_ratio": 10.0, "pb_ratio": 12.0, "roe_pct": 30.0, "revenue_growth_pct": 11.0, "debt_to_equity": 0.3},
+                {"ticker": "TSM", "sector": "Technology", "industry": "Semiconductors", "market_cap_bln": None, "market_cap_suspect": True, "market_cap_warning": "market cap failed sanity checks", "pe_ratio": 90.0, "pb_ratio": 25.0, "roe_pct": 6.0, "revenue_growth_pct": 2.0, "debt_to_equity": 0.1},
+            ],
+            {
+                "company_ticker": "NVDA",
+                "usable_peer_tickers": ["MSFT", "ORCL", "ADBE", "TSM"],
+            },
+            {"current_price": 100.0},
+            {"shares_outstanding_mln": 1000.0, "net_income_bln": 10.0, "equity_bln": 50.0},
+        )
+
+        self.assertEqual(peer_averages["pe_ratio_valid_count"], 4)
+        self.assertEqual(peer_averages["pb_ratio_valid_count"], 4)
+        self.assertEqual(peer_averages["pe_ratio"], 20.0)
+        self.assertAlmostEqual(peer_averages["pe_ratio_weighted_support"], 2.9, places=2)
+        self.assertTrue(peer_averages["valuation_low_confidence"])
+
     def test_extended_or_thematic_peers_are_used_when_strict_set_is_below_three(self) -> None:
         selected, meta = self.service._select_peers_from_candidates(
             {
@@ -1454,7 +1631,7 @@ class ScoringSafetyTests(unittest.TestCase):
 
         self.assertEqual(low_peer_score, high_peer_score)
 
-    def test_peer_rows_keep_missing_market_cap_as_none(self) -> None:
+    def test_peer_rows_hide_zero_quality_entries_from_ui(self) -> None:
         rows = self.service._peer_rows(
             [
                 {
@@ -1462,15 +1639,47 @@ class ScoringSafetyTests(unittest.TestCase):
                     "company": "Test",
                     "sector": "Technology",
                     "industry": "Software",
-                    "market_cap_bln": None,
+                    "market_cap_bln": 120.0,
                     "pe_ratio": None,
-                    "roe_pct": 12.0,
-                    "revenue_growth_pct": 5.0,
+                    "roe_pct": None,
+                    "revenue_growth_pct": None,
+                },
+                {
+                    "ticker": "GOOD",
+                    "company": "Good",
+                    "sector": "Technology",
+                    "industry": "Software",
+                    "market_cap_bln": 200.0,
+                    "pe_ratio": 20.0,
+                    "roe_pct": 18.0,
+                    "revenue_growth_pct": 12.0,
                 }
             ]
         )
 
-        self.assertIsNone(rows[0].market_cap_bln)
+        self.assertEqual([row.ticker for row in rows], ["GOOD"])
+
+    def test_peer_baseline_exclusion_is_logged_with_reason(self) -> None:
+        with self.assertLogs("app.services.analysis_runtime_service", level="INFO") as captured:
+            peer_averages = self.service._build_peer_averages(
+                [
+                    {"ticker": "GOOD1", "sector": "Technology", "industry": "Software", "market_cap_bln": 300.0, "pe_ratio": 18.0, "pb_ratio": 4.0, "roe_pct": 15.0, "revenue_growth_pct": 8.0, "debt_to_equity": 0.2},
+                    {"ticker": "GOOD2", "sector": "Technology", "industry": "Software", "market_cap_bln": 250.0, "pe_ratio": 20.0, "pb_ratio": 5.0, "roe_pct": 17.0, "revenue_growth_pct": 9.0, "debt_to_equity": 0.3},
+                    {"ticker": "GOOD3", "sector": "Technology", "industry": "Software", "market_cap_bln": 200.0, "pe_ratio": 22.0, "pb_ratio": 6.0, "roe_pct": 19.0, "revenue_growth_pct": 10.0, "debt_to_equity": 0.4},
+                    {"ticker": "BAD", "sector": "Unknown", "industry": "Unknown", "market_cap_bln": None, "market_cap_suspect": True, "pe_ratio": None, "pb_ratio": None, "roe_pct": None, "revenue_growth_pct": None, "debt_to_equity": None},
+                ],
+                {
+                    "company_ticker": "MSFT",
+                    "usable_peer_tickers": ["GOOD1", "GOOD2", "GOOD3", "BAD"],
+                },
+                {"current_price": 100.0},
+                {"shares_outstanding_mln": 1000.0, "net_income_bln": 10.0, "equity_bln": 50.0},
+            )
+
+        self.assertEqual(peer_averages["pe_ratio_valid_count"], 3)
+        joined_logs = "\n".join(captured.output)
+        self.assertIn("peer_row_excluded", joined_logs)
+        self.assertIn("BAD", joined_logs)
 
     def test_real_zero_stays_distinct_from_invalid(self) -> None:
         cards = self.service._metric_cards(

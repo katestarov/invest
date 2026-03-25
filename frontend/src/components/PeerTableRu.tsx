@@ -9,6 +9,19 @@ function displayValue(value: number | null, suffix = "") {
   return value === null ? "N/A" : `${value}${suffix}`;
 }
 
+function qualityLabel(row: PeerRow) {
+  if (row.quality_class === "weak") {
+    return "Limited data";
+  }
+  if (row.quality_class === "excluded") {
+    return "Excluded from baseline";
+  }
+  if (row.market_cap_status === "suspect") {
+    return "Suspect market cap";
+  }
+  return null;
+}
+
 export function PeerTableRu({ rows, selectedTicker }: Props) {
   return (
     <div className="panel">
@@ -33,7 +46,10 @@ export function PeerTableRu({ rows, selectedTicker }: Props) {
             {rows.map((row) => (
               <tr key={row.ticker} className={row.ticker === selectedTicker ? "selected-row" : ""}>
                 <td>{row.ticker}</td>
-                <td>{row.company}</td>
+                <td>
+                  <div>{row.company}</div>
+                  {qualityLabel(row) ? <small>{qualityLabel(row)}</small> : null}
+                </td>
                 <td>{row.score}</td>
                 <td>{displayValue(row.market_cap_bln, "B") === "N/A" ? "N/A" : `$${displayValue(row.market_cap_bln, "B")}`}</td>
                 <td>{displayValue(row.pe_ratio)}</td>

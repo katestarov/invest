@@ -174,6 +174,7 @@ _BUSINESS_TYPE_UNIVERSES: dict[str, list[str]] = {
     "INSURANCE": ["PGR", "TRV", "ALL", "CB", "AIG", "MET", "PRU"],
     "ASSET_MANAGER": ["BLK", "KKR", "BX", "TROW", "BEN", "APO"],
     "PAYMENTS": ["V", "MA", "PYPL", "AXP", "FI", "GPN"],
+    "AUTO_MANUFACTURER": ["TSLA", "GM", "F", "TM", "HMC", "STLA", "RACE", "RIVN", "LI", "NIO", "XPEV", "LCID"],
     "SEMICONDUCTORS": ["NVDA", "AMD", "AVGO", "QCOM", "INTC", "TSM", "TXN"],
     "SOFTWARE": ["MSFT", "ORCL", "CRM", "NOW", "ADBE", "SAP"],
     "ENTERPRISE_SOFTWARE": ["MSFT", "ORCL", "CRM", "NOW", "SAP", "ADBE"],
@@ -189,6 +190,29 @@ _BUSINESS_TYPE_UNIVERSES: dict[str, list[str]] = {
     "HEALTHCARE": ["UNH", "HCA", "CI", "HUM", "ELV", "CVS"],
     "PHARMA": ["LLY", "PFE", "MRK", "JNJ", "BMY", "ABBV"],
     "INDUSTRIALS": ["GE", "CAT", "DE", "HON", "ETN", "EMR"],
+}
+
+_BUSINESS_TYPE_PROFILE_HINTS: dict[str, tuple[str, str]] = {
+    "BANK": ("Financial Services", "Banks"),
+    "INSURANCE": ("Financial Services", "Insurance"),
+    "ASSET_MANAGER": ("Financial Services", "Asset Management"),
+    "PAYMENTS": ("Financial Services", "Credit Services"),
+    "AUTO_MANUFACTURER": ("Consumer Cyclical", "Automobiles"),
+    "SEMICONDUCTORS": ("Technology", "Semiconductors"),
+    "SOFTWARE": ("Technology", "Software"),
+    "ENTERPRISE_SOFTWARE": ("Technology", "Software - Infrastructure"),
+    "CONSUMER_HARDWARE_ECOSYSTEM": ("Technology", "Consumer Electronics"),
+    "INTERNET_PLATFORM": ("Communication Services", "Internet Content & Information"),
+    "E_COMMERCE": ("Consumer Cyclical", "Internet Retail"),
+    "RESTAURANTS": ("Consumer Cyclical", "Restaurants"),
+    "RETAIL": ("Consumer Defensive", "Retail"),
+    "HOME_IMPROVEMENT_RETAIL": ("Consumer Cyclical", "Home Improvement Retail"),
+    "OIL_GAS": ("Energy", "Oil & Gas Integrated"),
+    "MINING": ("Basic Materials", "Metals & Mining"),
+    "REIT": ("Real Estate", "Real Estate Investment Trust"),
+    "HEALTHCARE": ("Healthcare", "Healthcare Plans"),
+    "PHARMA": ("Healthcare", "Drug Manufacturers"),
+    "INDUSTRIALS": ("Industrials", "Industrial Conglomerates"),
 }
 
 
@@ -221,6 +245,18 @@ def classify_company(
         "O": "REIT",
         "AAPL": "CONSUMER_HARDWARE_ECOSYSTEM",
         "MSFT": "ENTERPRISE_SOFTWARE",
+        "TSLA": "AUTO_MANUFACTURER",
+        "GM": "AUTO_MANUFACTURER",
+        "F": "AUTO_MANUFACTURER",
+        "TM": "AUTO_MANUFACTURER",
+        "HMC": "AUTO_MANUFACTURER",
+        "STLA": "AUTO_MANUFACTURER",
+        "RACE": "AUTO_MANUFACTURER",
+        "RIVN": "AUTO_MANUFACTURER",
+        "LI": "AUTO_MANUFACTURER",
+        "NIO": "AUTO_MANUFACTURER",
+        "XPEV": "AUTO_MANUFACTURER",
+        "LCID": "AUTO_MANUFACTURER",
     }
     if ticker_text in ticker_overrides:
         return ticker_overrides[ticker_text], "high", f"matched by ticker override {ticker_text}"
@@ -230,6 +266,7 @@ def classify_company(
         ("INSURANCE", ("insurance", "insurer", "property casualty", "life insurance")),
         ("ASSET_MANAGER", ("asset management", "wealth management", "investment management", "private equity")),
         ("PAYMENTS", ("payment", "payments", "card network", "merchant acquiring", "digital wallet", "credit services", "card issuer", "merchant services")),
+        ("AUTO_MANUFACTURER", ("automobile", "automobiles", "automotive", "vehicle manufacturer", "auto manufacturer", "electric vehicle", "electric vehicles", "ev manufacturer")),
         ("SEMICONDUCTORS", ("semiconductor", "chip", "gpu", "microprocessor")),
         ("ENTERPRISE_SOFTWARE", ("enterprise software", "enterprise application", "crm", "erp", "workflow automation")),
         ("CONSUMER_HARDWARE_ECOSYSTEM", ("consumer electronics", "smartphone", "personal computer", "computer hardware", "hardware ecosystem")),
@@ -272,11 +309,16 @@ def get_business_type_universe(business_type: str | None) -> list[str]:
     return list(_BUSINESS_TYPE_UNIVERSES.get((business_type or "").upper(), []))
 
 
+def get_business_type_profile_hints(business_type: str | None) -> tuple[str | None, str | None]:
+    return _BUSINESS_TYPE_PROFILE_HINTS.get((business_type or "").upper(), (None, None))
+
+
 _COMPATIBILITY_RULES: dict[str, dict[str, tuple[str, ...]]] = {
     "BANK": {"STRICT": ("BANK",), "RELATED": ("PAYMENTS",), "WEAK": ("ASSET_MANAGER",)},
     "INSURANCE": {"STRICT": ("INSURANCE",), "WEAK": ("ASSET_MANAGER",)},
     "ASSET_MANAGER": {"STRICT": ("ASSET_MANAGER",), "RELATED": ("PAYMENTS",), "WEAK": ("BANK", "INSURANCE")},
     "PAYMENTS": {"STRICT": ("PAYMENTS",), "RELATED": ("INTERNET_PLATFORM",), "WEAK": ("BANK", "ASSET_MANAGER")},
+    "AUTO_MANUFACTURER": {"STRICT": ("AUTO_MANUFACTURER",), "RELATED": ("INDUSTRIALS",), "WEAK": ("CONSUMER_HARDWARE_ECOSYSTEM",)},
     "SEMICONDUCTORS": {"STRICT": ("SEMICONDUCTORS",), "RELATED": ("CONSUMER_HARDWARE_ECOSYSTEM",), "WEAK": ("ENTERPRISE_SOFTWARE",)},
     "SOFTWARE": {"STRICT": ("SOFTWARE", "ENTERPRISE_SOFTWARE"), "RELATED": ("INTERNET_PLATFORM",), "WEAK": ("CONSUMER_HARDWARE_ECOSYSTEM",)},
     "ENTERPRISE_SOFTWARE": {"STRICT": ("ENTERPRISE_SOFTWARE", "SOFTWARE"), "RELATED": ("INTERNET_PLATFORM",), "WEAK": ("CONSUMER_HARDWARE_ECOSYSTEM",)},

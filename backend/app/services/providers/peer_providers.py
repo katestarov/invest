@@ -112,6 +112,12 @@ class ConfigPeerProvider(PeerProvider):
                 sector_only_match = rule
 
         matched_rule = strict_match or sector_only_match
+        if matched_rule is None and get_business_type_universe(company_profile.get("business_type")):
+            return PeerDiscoveryResult(
+                candidates=[],
+                source=self.source_name,
+                reason="skipped broad config fallback because a business-type-safe universe is available",
+            )
         selected = matched_rule["tickers"] if matched_rule else self.peer_group_config["fallback"]["tickers"]
         reason = (
             "selected from local config fallback due to insufficient API peers"
@@ -131,8 +137,11 @@ class BusinessTypePeerProvider(PeerProvider):
     def discover(self, ticker: str, company_profile: dict) -> PeerDiscoveryResult:
         business_type = company_profile.get("business_type")
         tickers = [item for item in get_business_type_universe(business_type) if item != ticker]
+        reason = "selected via business-type fallback universe"
+        if str(business_type or "").upper() == "AUTO_MANUFACTURER":
+            reason = "selected via sector-safe auto/EV fallback universe"
         return PeerDiscoveryResult(
             candidates=[PeerCandidate(ticker=item, source=self.source_name) for item in tickers],
             source=self.source_name,
-            reason="selected via business-type fallback universe",
+            reason=reason,
         )

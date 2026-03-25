@@ -25,9 +25,11 @@ export type PeerRow = {
   industry: string;
   score: number;
   market_cap_bln: number | null;
+  market_cap_status: "valid" | "suspect" | "invalid";
   pe_ratio: number | null;
   roe_pct: number | null;
   revenue_growth_pct: number | null;
+  quality_class: "usable" | "weak" | "excluded";
 };
 
 export type FundamentalTrendPoint = {

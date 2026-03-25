@@ -216,11 +216,27 @@ class YahooFinanceProvider(BaseHttpProvider):
     source_name = "Yahoo Finance"
 
     def fetch_company_bundle(self, ticker: str) -> ProviderResult:
+        warnings: list[str] = []
         chart = self._get_json(
             f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}",
             params={"range": "5y", "interval": "1mo", "includeAdjustedClose": "true"},
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"},
         )
+        quote_result: dict[str, object] = {}
+        try:
+            quote = self._get_json(
+                "https://query1.finance.yahoo.com/v7/finance/quote",
+                params={"symbols": ticker},
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"},
+            )
+            quote_items = quote.get("quoteResponse", {}).get("result", []) if isinstance(quote, dict) else []
+            if quote_items:
+                quote_result = quote_items[0]
+        except Exception as exc:
+            logger.warning(
+                "yahoo_quote_snapshot_unavailable",
+                extra={"ticker": ticker, "error_type": type(exc).__name__},
+            )
         chart_result = chart["chart"]["result"][0]
         meta = chart_result.get("meta", {})
         timestamps = chart_result.get("timestamp", [])
@@ -247,13 +263,23 @@ class YahooFinanceProvider(BaseHttpProvider):
 
         payload = {
             "company": meta.get("longName") or meta.get("shortName") or ticker,
-            "currency": meta.get("currency", "USD"),
+            "currency": quote_result.get("currency") or meta.get("currency", "USD"),
             "current_price": round_or_none(_safe_number(meta.get("regularMarketPrice") or meta.get("previousClose")), 2),
+            "market_cap_bln_quote": round_or_none(
+                _safe_number(quote_result.get("marketCap")) / 1_000_000_000 if _safe_number(quote_result.get("marketCap")) is not None else None,
+                2,
+            ),
+            "market_cap_quote_currency": quote_result.get("currency") or meta.get("currency", "USD"),
+            "shares_outstanding_quote_mln": round_or_none(
+                _safe_number(quote_result.get("sharesOutstanding")) / 1_000_000 if _safe_number(quote_result.get("sharesOutstanding")) is not None else None,
+                2,
+            ),
+            "quote_type": quote_result.get("quoteType"),
             "one_year_return_pct": round(one_year_return, 2),
             "five_year_return_pct": round(five_year_return, 2),
             "price_history": price_history[-24:],
         }
-        return ProviderResult(payload=payload, warnings=[])
+        return ProviderResult(payload=payload, warnings=warnings)
 
 
 class SecEdgarProvider(BaseHttpProvider):
