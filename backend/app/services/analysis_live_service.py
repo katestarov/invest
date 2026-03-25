@@ -88,6 +88,9 @@ class AnalysisService:
         fred_result = self.fred.fetch_macro_bundle()
         world_bank_result = self.world_bank.fetch_macro_bundle()
 
+        print("=== FRED DEBUG ===", flush=True)
+        print("payload:", fred_result.payload, flush=True)
+        print("warnings:", fred_result.warnings, flush=True)
         warnings.extend(yahoo_result.warnings)
         warnings.extend(edgar_result.warnings)
         warnings.extend(fred_result.warnings)
