@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+import math
+import re
+
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
@@ -18,6 +22,7 @@ from app.schemas.analysis import (
 from app.services.analysis_safety import (
     apply_low_confidence_cap,
     business_type_compatibility,
+    clamp_or_none,
     classify_company,
     coverage_ratio,
     get_business_type_universe,
@@ -40,6 +45,8 @@ from app.services.providers.live_clients import (
 )
 from app.services.providers.peer_providers import BusinessTypePeerProvider, ConfigPeerProvider, FmpPeerProvider, FinnhubPeerProvider, PeerDiscoveryResult
 from app.utils.cache import TTLCache
+
+logger = logging.getLogger(__name__)
 
 
 class AnalysisService:
@@ -69,7 +76,7 @@ class AnalysisService:
         )
 
     def analyze(self, ticker: str) -> AnalysisResponse:
-        normalized_ticker = ticker.upper().strip()
+        normalized_ticker = self._normalize_ticker(ticker)
         cached_response = self.analysis_cache.get(normalized_ticker)
         if cached_response is not None:
             return cached_response
@@ -115,10 +122,10 @@ class AnalysisService:
             peer_averages | peer_selection,
             is_bank_like,
         )
-        warnings.extend(self._build_data_quality_warnings(edgar_result.payload, macro, peer_averages | peer_selection, is_bank_like))
+        warnings.extend(self._build_data_quality_warnings(edgar_result.payload, macro, peer_averages | peer_selection, is_bank_like, silver_metrics))
         warnings.extend(self._build_completeness_warnings(silver_metrics, macro))
         weighted_scores = self._build_weighted_scores(silver_metrics, macro)
-        total_score = round(sum(score * weight for score, weight, _ in weighted_scores.values()), 1)
+        total_score = round(sum((score or 0.0) * weight for score, weight, _ in weighted_scores.values()), 1)
         verdict = self._verdict(total_score)
         warnings = self._dedupe_warnings(warnings)
         narrative = self._build_narrative(company_profile["company"], total_score, weighted_scores, warnings)
@@ -136,7 +143,7 @@ class AnalysisService:
                 ScoreBreakdownItem(
                     key=key,
                     label=self.scoring_config["labels"].get(key, key),
-                    score=round(score, 1),
+                    score=round_or_none(score if weight > 0 else None, 1),
                     weight=weight,
                     summary=summary,
                 )
@@ -168,6 +175,16 @@ class AnalysisService:
             ],
             warnings=warnings,
         )
+        logger.info(
+            "analysis_completed",
+            extra={
+                "ticker": normalized_ticker,
+                "peer_mode": peer_selection.get("peer_selection_mode"),
+                "baseline_mode": peer_averages.get("valuation_baseline_mode"),
+                "peer_count": peer_selection.get("peer_count_usable"),
+                "warning_count": len(warnings),
+            },
+        )
 
         self._persist_layers(
             normalized_ticker,
@@ -182,8 +199,20 @@ class AnalysisService:
         self.analysis_cache.set(normalized_ticker, response)
         return response
 
+    def _normalize_ticker(self, ticker: str) -> str:
+        normalized_ticker = str(ticker or "").upper().strip()
+        if not re.fullmatch(r"[A-Z0-9]{1,16}", normalized_ticker):
+            raise ValueError("Ticker must contain only Latin letters and digits and be 1-16 characters long.")
+        return normalized_ticker
+
     def clear_cache(self) -> None:
         self.analysis_cache.clear()
+
+    def close(self) -> None:
+        for provider in (self.yahoo, self.edgar, self.fred, self.world_bank):
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
 
     def _persist_layers(
         self,
@@ -208,6 +237,7 @@ class AnalysisService:
             repository.commit()
         except Exception:
             session.rollback()
+            logger.exception("persist_layers_failed", extra={"ticker": ticker})
         finally:
             session.close()
 
@@ -218,6 +248,11 @@ class AnalysisService:
             return cached
 
         company_market_cap = self._market_cap_bln(yahoo, edgar)
+        company_profile = company_profile | {
+            "market_cap_bln": company_market_cap,
+            "revenue_bln_latest": (edgar.get("revenue_bln") or [None])[0],
+            "ebit_margin_pct": edgar.get("ebit_margin_pct"),
+        }
         fallback_rows: list[dict] = []
         fallback_meta = {
             "peer_selection_confidence": "low",
@@ -261,26 +296,31 @@ class AnalysisService:
         return fallback_rows, fallback_meta
 
     def _build_silver_metrics(self, yahoo: dict, edgar: dict, peers: dict, is_bank_like: bool = False) -> dict:
-        revenue_history = edgar.get("revenue_bln", [])
-        revenue_cagr_like = None
-        if len(revenue_history) >= 2:
-            cagr_ratio = safe_ratio(revenue_history[0], revenue_history[-1])
-            revenue_cagr_like = round_or_none((cagr_ratio - 1) * 100 if cagr_ratio is not None else None, 2)
-
+        revenue_cagr_like = self._revenue_cagr_like_pct(edgar)
         market_cap_bln = self._market_cap_bln(yahoo, edgar)
+        roe_assessment = self._roe_assessment(edgar, market_cap_bln)
         pe_ratio = self._pe_ratio(yahoo, edgar)
         pb_ratio = self._pb_ratio(yahoo, edgar)
-        roe_pct = self._roe_pct(edgar)
         revenue_growth_pct = self._revenue_growth_pct(edgar)
+        peer_confidence = peers.get("peer_confidence", peers.get("peer_selection_confidence", "low"))
+        peer_count_usable = peers.get("peer_count_usable", 0)
+        minimum_usable_peers = max(3, self.peer_min_valid_count)
+        valuation_enabled = bool(
+            peer_count_usable >= minimum_usable_peers
+            and peers.get("pe_ratio_valid_count", 0) >= minimum_usable_peers
+            and peers.get("pb_ratio_valid_count", 0) >= minimum_usable_peers
+        )
+        pe_premium_pct = round_or_none(premium_pct(pe_ratio, peers["pe_ratio"]), 2) if valuation_enabled else None
+        pb_premium_pct = round_or_none(premium_pct(pb_ratio, peers["pb_ratio"]), 2) if valuation_enabled else None
 
-        pe_premium_pct = round_or_none(premium_pct(pe_ratio, peers["pe_ratio"]), 2)
-        pb_premium_pct = round_or_none(premium_pct(pb_ratio, peers["pb_ratio"]), 2)
-
-        return {
+        metrics = {
             "market_cap_bln": market_cap_bln,
             "pe_ratio": pe_ratio,
             "pb_ratio": pb_ratio,
-            "roe_pct": roe_pct,
+            "roe_pct": roe_assessment["display_pct"],
+            "roe_score_pct": roe_assessment["score_input_pct"],
+            "roe_reliable": roe_assessment["reliable"],
+            "roe_reliability_reason": roe_assessment["reason"],
             "roic_pct": edgar.get("roic_pct"),
             "ebit_margin_pct": edgar.get("ebit_margin_pct"),
             "revenue_growth_pct": revenue_growth_pct,
@@ -306,16 +346,61 @@ class AnalysisService:
             "peer_growth_noisy": peers.get("revenue_growth_pct_baseline_noisy", True),
             "peer_debt_noisy": peers.get("debt_to_equity_baseline_noisy", True),
             "peer_selection_mode": peers.get("peer_selection_mode", "fallback"),
-            "peer_confidence": peers.get("peer_confidence", peers.get("peer_selection_confidence", "low")),
+            "peer_confidence": peer_confidence,
+            "peer_confidence_multiplier": self._peer_confidence_multiplier(peer_confidence),
             "peer_count_total": peers.get("peer_count_total", peers.get("peer_count", 0)),
-            "peer_count_usable": peers.get("peer_count_usable", 0),
+            "peer_count_usable": peer_count_usable,
+            "peer_baseline_reliability": peers.get("peer_baseline_reliability", "low"),
             "valuation_baseline_mode": peers.get("valuation_baseline_mode", "peer"),
             "peer_selection_confidence": peers.get("peer_selection_confidence", "low"),
             "peer_selection_reason": peers.get("peer_selection_reason", "fallback"),
+            "valuation_enabled": valuation_enabled,
+            "profitability_reliability_multiplier": roe_assessment["weight_multiplier"],
             "pe_premium_pct": pe_premium_pct,
             "pb_premium_pct": pb_premium_pct,
             "is_bank_like": is_bank_like,
         }
+        tracked_metrics = [
+            metrics.get("pe_ratio"),
+            metrics.get("pb_ratio"),
+            metrics.get("roe_score_pct"),
+            metrics.get("roic_pct"),
+            metrics.get("ebit_margin_pct"),
+            metrics.get("revenue_growth_pct"),
+            metrics.get("revenue_cagr_like_pct"),
+            metrics.get("fcf_margin_pct"),
+            metrics.get("debt_to_equity"),
+            metrics.get("current_ratio"),
+            metrics.get("one_year_return_pct"),
+            metrics.get("five_year_return_pct"),
+        ]
+        completeness = len([value for value in tracked_metrics if value is not None]) / max(len(tracked_metrics), 1)
+        peer_reliability = {"high": 1.0, "medium": 0.85, "low": 0.7}.get(metrics["peer_baseline_reliability"], 0.7)
+        noise_penalty = 0.85 if metrics.get("peer_pe_noisy") or metrics.get("peer_pb_noisy") else 1.0
+        reliability_components = [
+            metrics["peer_confidence_multiplier"],
+            peer_reliability,
+            noise_penalty,
+            roe_assessment["weight_multiplier"],
+        ]
+        metrics["data_completeness_score"] = round(completeness * 100, 1)
+        metrics["data_reliability_score"] = round(
+            (sum(reliability_components) / max(len(reliability_components), 1)) * 100,
+            1,
+        )
+        return metrics
+
+    def _revenue_cagr_like_pct(self, edgar: dict) -> float | None:
+        revenue_history = edgar.get("revenue_bln", [])
+        if len(revenue_history) < 2:
+            return None
+        latest_revenue = revenue_history[0]
+        earliest_revenue = revenue_history[-1]
+        interval_count = len(revenue_history) - 1
+        growth_ratio = safe_ratio(latest_revenue, earliest_revenue)
+        if growth_ratio is None or growth_ratio <= 0 or interval_count <= 0:
+            return None
+        return round_or_none(((growth_ratio ** (1 / interval_count)) - 1) * 100, 2)
 
     def _fetch_peer_rows(self, tickers: list[str], company_ticker: str) -> list[dict]:
         rows: list[dict] = []
@@ -335,8 +420,14 @@ class AnalysisService:
                         "market_cap_bln": self._market_cap_bln(yahoo_payload, edgar_payload),
                         "pe_ratio": self._pe_ratio(yahoo_payload, edgar_payload),
                         "pb_ratio": self._pb_ratio(yahoo_payload, edgar_payload),
-                        "roe_pct": self._roe_pct(edgar_payload),
+                        "roe_pct": self._roe_assessment(
+                            edgar_payload,
+                            self._market_cap_bln(yahoo_payload, edgar_payload),
+                        )["score_input_pct"],
                         "revenue_growth_pct": self._revenue_growth_pct(edgar_payload),
+                        "revenue_bln": (edgar_payload.get("revenue_bln") or [None])[0],
+                        "ebit_margin_pct": edgar_payload.get("ebit_margin_pct"),
+                        "roic_pct": edgar_payload.get("roic_pct"),
                         "debt_to_equity": edgar_payload.get("debt_to_equity"),
                     }
                 )
@@ -376,13 +467,14 @@ class AnalysisService:
         peer_selection_mode = "fallback"
         chosen_ranked = strict_ranked + extended_ranked + fallback_ranked
         usable_ranked = fallback_usable
-        if len(strict_usable) >= 2:
+        minimum_usable_peers = max(3, self.peer_min_valid_count)
+        if len(strict_usable) >= minimum_usable_peers:
             peer_selection_mode = "strict"
-            chosen_ranked = strict_ranked + extended_ranked + fallback_ranked
+            chosen_ranked = strict_ranked
             usable_ranked = strict_usable
-        elif len(extended_usable) >= 2:
+        elif len(extended_usable) >= minimum_usable_peers:
             peer_selection_mode = "extended"
-            chosen_ranked = strict_ranked + extended_ranked + fallback_ranked
+            chosen_ranked = strict_ranked + extended_ranked
             usable_ranked = extended_usable
 
         selected = [candidate for _, candidate, _, _ in chosen_ranked[: self.peer_target_count]]
@@ -413,13 +505,13 @@ class AnalysisService:
             and strict_share >= 0.5
         )
         if peer_selection_mode == "extended":
-            quality_passed = bool(selected and average_score >= 2.0 and len(usable_selected) >= 2)
+            quality_passed = bool(selected and average_score >= 2.0)
         if peer_selection_mode == "fallback":
             quality_passed = False
         sample_mode = "excluded"
         if len(usable_selected) >= self.peer_target_count:
             sample_mode = "full"
-        elif len(usable_selected) >= self.peer_min_valid_count:
+        elif len(usable_selected) >= minimum_usable_peers:
             sample_mode = "limited"
         elif len(usable_selected) >= 1:
             sample_mode = "very_small"
@@ -432,10 +524,19 @@ class AnalysisService:
             confidence = "high"
         elif peer_selection_mode in {"strict", "extended"} and len(usable_selected) >= 2:
             confidence = "medium"
+        elif peer_selection_mode == "fallback" and len(usable_selected) >= 1:
+            confidence = "low"
+        peer_baseline_reliability = "low"
+        if len(usable_selected) >= self.peer_target_count:
+            peer_baseline_reliability = "high"
+        elif len(usable_selected) >= minimum_usable_peers:
+            peer_baseline_reliability = "medium"
         reason = "manual peer group" if manual_valid >= 3 else "auto-selected peers"
         return selected, {
+            "company_ticker": company_profile.get("ticker"),
             "peer_selection_mode": peer_selection_mode,
             "peer_confidence": confidence,
+            "peer_baseline_reliability": peer_baseline_reliability,
             "peer_selection_confidence": confidence,
             "peer_selection_reason": reason,
             "peer_group_quality_passed": quality_passed,
@@ -458,7 +559,7 @@ class AnalysisService:
     ) -> bool:
         if selection_meta.get("peer_selection_mode") == "strict" and selection_meta.get("peer_sample_mode") == "full":
             return True
-        if selection_meta.get("peer_selection_mode") == "extended" and selection_meta.get("peer_count_usable", 0) >= self.peer_min_valid_count:
+        if selection_meta.get("peer_selection_mode") == "extended" and selection_meta.get("peer_count_usable", 0) >= max(3, self.peer_min_valid_count):
             return True
         return False
 
@@ -490,29 +591,31 @@ class AnalysisService:
         company_business_type = company_profile.get("business_type", "OTHER")
         candidate_business_type = self._candidate_business_type(candidate)
         compatibility = business_type_compatibility(company_business_type, candidate_business_type)
-        if compatibility == "REJECT" and self._is_mega_cap_tech_pair(company_profile.get("ticker"), candidate.get("ticker")):
-            return "WEAK"
+        if self._is_mega_cap_tech_pair(company_profile.get("ticker"), candidate.get("ticker")):
+            if compatibility in {"REJECT", "WEAK"}:
+                return "RELATED"
         return compatibility
 
     def _industry_is_close(self, company_profile: dict, candidate: dict) -> bool:
         company_sic = str(company_profile.get("sic") or "")
         candidate_sic = str(candidate.get("sic") or "")
-        company_industry = (company_profile.get("industry") or "").lower()
-        candidate_industry = (candidate.get("industry") or "").lower()
         if company_sic and candidate_sic and (company_sic[:4] == candidate_sic[:4] or company_sic[:3] == candidate_sic[:3]):
             return True
-        if company_industry and candidate_industry:
-            if company_industry in candidate_industry or candidate_industry in company_industry:
-                return True
-            company_tokens = [token for token in company_industry.replace("&", " ").replace("-", " ").split() if len(token) > 4]
-            return any(token in candidate_industry for token in company_tokens)
-        return False
+        return self._industry_similarity_score(
+            company_profile.get("industry"),
+            candidate.get("industry"),
+        ) >= 0.34
 
     def _special_peer_universe(self, company_profile: dict) -> list[str]:
-        ticker = str(company_profile.get("ticker") or "").upper()
         business_type = str(company_profile.get("business_type") or "").upper()
-        if ticker in {"AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"}:
-            return ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "ORCL", "CRM", "ADBE", "SAP"]
+        if business_type == "CONSUMER_HARDWARE_ECOSYSTEM":
+            return ["AAPL", "MSFT", "NVDA", "QCOM", "SONY", "DELL", "HPQ", "SMSN"]
+        if business_type == "ENTERPRISE_SOFTWARE":
+            return ["MSFT", "ORCL", "ADBE", "SAP", "NOW", "CRM"]
+        if business_type == "INTERNET_PLATFORM":
+            return ["META", "GOOGL", "AMZN", "UBER", "ABNB", "BKNG", "EXPE", "SNAP", "PINS", "TTD"]
+        if business_type == "PHARMA":
+            return ["LLY", "PFE", "MRK", "JNJ", "ABBV", "BMY", "AZN", "NVS"]
         if business_type == "BANK":
             return ["JPM", "BAC", "WFC", "C", "USB", "PNC", "GS", "MS"]
         if business_type == "PAYMENTS":
@@ -523,6 +626,98 @@ class AnalysisService:
         mega_cap_tech = {"AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"}
         return str(ticker_a or "").upper() in mega_cap_tech and str(ticker_b or "").upper() in mega_cap_tech
 
+    def _peer_confidence_multiplier(self, confidence: str | None) -> float:
+        return {"high": 1.0, "medium": 0.85, "low": 0.65}.get(str(confidence or "").lower(), 0.65)
+
+    def _roe_equity_threshold_bln(self, market_cap_bln: float | None) -> float:
+        if market_cap_bln is None or market_cap_bln <= 0:
+            return 1.0
+        return max(1.0, min(market_cap_bln * 0.08, 75.0))
+
+    def _normalized_tokens(self, value: str | None) -> set[str]:
+        text = (value or "").lower()
+        tokens = re.split(r"[^a-z0-9]+", text)
+        stop_words = {"and", "the", "for", "with", "services", "service", "information"}
+        return {token for token in tokens if len(token) >= 3 and token not in stop_words}
+
+    def _industry_similarity_score(self, company_industry: str | None, candidate_industry: str | None) -> float:
+        company_text = (company_industry or "").lower().strip()
+        candidate_text = (candidate_industry or "").lower().strip()
+        if not company_text or not candidate_text:
+            return 0.0
+        if company_text in candidate_text or candidate_text in company_text:
+            return 1.0
+        company_tokens = self._normalized_tokens(company_text)
+        candidate_tokens = self._normalized_tokens(candidate_text)
+        if not company_tokens or not candidate_tokens:
+            return 0.0
+        overlap = len(company_tokens & candidate_tokens)
+        union = len(company_tokens | candidate_tokens)
+        return overlap / union if union else 0.0
+
+    def _relative_scale_score(
+        self,
+        company_value: float | None,
+        candidate_value: float | None,
+        *,
+        lower_ratio: float,
+        upper_ratio: float,
+        bonus: float,
+        penalty: float,
+    ) -> float:
+        if company_value is None or candidate_value is None or company_value <= 0 or candidate_value <= 0:
+            return 0.0
+        ratio = candidate_value / company_value
+        if lower_ratio <= ratio <= upper_ratio:
+            return bonus
+        log_distance = abs(math.log(ratio))
+        band_distance = max(abs(math.log(lower_ratio)), abs(math.log(upper_ratio)))
+        if band_distance <= 0:
+            return 0.0
+        return -min((log_distance - band_distance) / band_distance, 1.0) * penalty
+
+    def _margin_similarity_score(self, company_margin: float | None, candidate_margin: float | None) -> float:
+        if company_margin is None or candidate_margin is None:
+            return 0.0
+        distance = abs(company_margin - candidate_margin)
+        if distance <= 5:
+            return 1.0
+        if distance <= 10:
+            return 0.6
+        if distance <= 20:
+            return 0.2
+        return -0.6
+
+    def _roe_assessment(self, edgar: dict, market_cap_bln: float | None) -> dict[str, float | bool | str | None]:
+        net_income = edgar.get("net_income_bln")
+        equity = edgar.get("equity_bln")
+        roic_pct = clamp_or_none(edgar.get("roic_pct"), 0.0, 100.0)
+        ratio = safe_ratio(net_income, equity)
+        display_pct = round_or_none(ratio * 100 if ratio is not None else None, 2)
+        clamped_roe = round_or_none(clamp_or_none(display_pct, 0.0, 100.0), 2)
+
+        reliable = True
+        reason: str | None = None
+        if display_pct is None:
+            reliable = False
+            reason = "ROE unavailable because equity is non-interpretable"
+        elif equity is not None and equity < self._roe_equity_threshold_bln(market_cap_bln):
+            reliable = False
+            reason = "ROE treated as unreliable because the equity base is too small relative to market value"
+
+        score_input = roic_pct if not reliable and roic_pct is not None else clamped_roe
+        weight_multiplier = 1.0
+        if not reliable:
+            weight_multiplier = 0.9 if roic_pct is not None else 0.75
+
+        return {
+            "display_pct": display_pct,
+            "score_input_pct": score_input,
+            "reliable": reliable,
+            "reason": reason,
+            "weight_multiplier": weight_multiplier,
+        }
+
     def _peer_match_score(self, company_profile: dict, company_market_cap: float | None, candidate: dict) -> float:
         score = 0.0
         company_sic = str(company_profile.get("sic") or "")
@@ -531,7 +726,7 @@ class AnalysisService:
         candidate_industry = (candidate.get("industry") or "").lower()
         company_business_type = company_profile.get("business_type", "OTHER")
         candidate_business_type = self._candidate_business_type(candidate)
-        compatibility = business_type_compatibility(company_business_type, candidate_business_type)
+        compatibility = self._peer_compatibility(company_profile, candidate)
         if compatibility == "REJECT":
             return -100.0
         if compatibility == "STRICT":
@@ -546,29 +741,44 @@ class AnalysisService:
 
         if company_sic and candidate_sic:
             if company_sic[:4] == candidate_sic[:4]:
-                score += 3.0
+                score += 4.5
             elif company_sic[:3] == candidate_sic[:3]:
-                score += 2.0
+                score += 3.0
             elif company_sic[:2] == candidate_sic[:2]:
-                score += 1.0
+                score += 1.5
 
-        if company_industry and candidate_industry:
-            if company_industry in candidate_industry or candidate_industry in company_industry:
-                score += 2.0
-            elif any(token in candidate_industry for token in company_industry.split() if len(token) > 4):
-                score += 1.0
+        score += self._industry_similarity_score(company_industry, candidate_industry) * 3.0
 
         if company_profile.get("sector") == candidate.get("sector"):
-            score += 1.0
+            score += 0.75
 
         candidate_market_cap = candidate.get("market_cap_bln")
-        if company_market_cap and candidate_market_cap and company_market_cap > 0 and candidate_market_cap > 0:
-            distance = abs(company_market_cap - candidate_market_cap) / max(company_market_cap, candidate_market_cap)
-            score -= min(distance, 1.5)
+        score += self._relative_scale_score(
+            company_market_cap,
+            candidate_market_cap,
+            lower_ratio=0.30,
+            upper_ratio=1.70,
+            bonus=1.5,
+            penalty=1.5,
+        )
+        score += self._relative_scale_score(
+            company_profile.get("revenue_bln_latest"),
+            candidate.get("revenue_bln"),
+            lower_ratio=0.35,
+            upper_ratio=2.50,
+            bonus=0.9,
+            penalty=1.0,
+        )
+        score += self._margin_similarity_score(
+            company_profile.get("ebit_margin_pct"),
+            candidate.get("ebit_margin_pct"),
+        )
 
         score -= max(0, 4 - self._peer_data_quality(candidate)) * 0.35
         if compatibility == "WEAK":
             score -= 1.25
+        if self._is_mega_cap_tech_pair(company_profile.get("ticker"), candidate.get("ticker")):
+            score += 1.0
         if candidate.get("pe_ratio") is not None and candidate["pe_ratio"] > 120:
             score -= 0.6
         if candidate.get("pb_ratio") is not None and candidate["pb_ratio"] > 25:
@@ -622,33 +832,82 @@ class AnalysisService:
         return candidate_rank > current_rank
 
     def _peer_data_quality(self, candidate: dict) -> int:
-        return sum(
-            1
-            for key in ("pe_ratio", "pb_ratio", "roe_pct", "revenue_growth_pct", "debt_to_equity")
-            if candidate.get(key) is not None
-        )
+        metric_availability = self._peer_metric_availability(candidate)
+        core_metrics = ("pe_ratio", "roe_pct", "revenue_growth_pct")
+        optional_metrics = ("pb_ratio", "debt_to_equity")
+        core_count = sum(1 for key in core_metrics if metric_availability[key])
+        optional_count = sum(1 for key in optional_metrics if metric_availability[key])
+        return (core_count * 2) + optional_count
+
+    def _peer_metric_availability(self, candidate: dict) -> dict[str, bool]:
+        return {
+            "pe_ratio": candidate.get("pe_ratio") is not None,
+            "pb_ratio": candidate.get("pb_ratio") is not None,
+            "roe_pct": candidate.get("roe_pct") is not None,
+            "revenue_growth_pct": candidate.get("revenue_growth_pct") is not None,
+            "debt_to_equity": candidate.get("debt_to_equity") is not None,
+        }
 
     def _build_peer_averages(self, peers: list[dict], peer_selection: dict, yahoo: dict, edgar: dict) -> dict:
         usable_tickers = set(peer_selection.get("usable_peer_tickers", []))
         usable_rows = [row for row in peers if row.get("ticker") in usable_tickers]
-        baseline_rows = usable_rows or peers
-        averages = summarize_peer_averages(baseline_rows)
-        averages["valuation_baseline_mode"] = "peer"
+        minimum_usable_peers = max(3, self.peer_min_valid_count)
+        baseline_mode = "peer"
+        baseline_rows = usable_rows if len(usable_rows) >= minimum_usable_peers else []
+        company_ticker = str(peer_selection.get("company_ticker") or "").upper()
+        if self._is_mega_cap_tech_company(company_ticker) and len(usable_rows) < minimum_usable_peers and len(peers) >= minimum_usable_peers:
+            baseline_rows = peers
+            baseline_mode = "thematic"
+        elif len(usable_rows) < minimum_usable_peers and len(peers) >= minimum_usable_peers:
+            baseline_rows = peers
+            baseline_mode = "fallback"
+        elif len(usable_rows) < minimum_usable_peers:
+            baseline_rows = []
+            baseline_mode = "neutral"
+        baseline_candidates = baseline_rows or []
+        metric_rows = {
+            "pe_ratio": [row for row in baseline_candidates if row.get("pe_ratio") is not None],
+            "pb_ratio": [row for row in baseline_candidates if row.get("pb_ratio") is not None],
+            "roe_pct": [row for row in baseline_candidates if row.get("roe_pct") is not None],
+            "revenue_growth_pct": [row for row in baseline_candidates if row.get("revenue_growth_pct") is not None],
+            "debt_to_equity": [row for row in baseline_candidates if row.get("debt_to_equity") is not None],
+        }
+        averages = {
+            "pe_ratio": None,
+            "pb_ratio": None,
+            "roe_pct": None,
+            "revenue_growth_pct": None,
+            "debt_to_equity": None,
+            "pe_ratio_valid_count": 0,
+            "pb_ratio_valid_count": 0,
+            "roe_pct_valid_count": 0,
+            "revenue_growth_pct_valid_count": 0,
+            "debt_to_equity_valid_count": 0,
+            "pe_ratio_baseline_noisy": True,
+            "pb_ratio_baseline_noisy": True,
+            "roe_pct_baseline_noisy": True,
+            "revenue_growth_pct_baseline_noisy": True,
+            "debt_to_equity_baseline_noisy": True,
+        }
+        for metric, rows in metric_rows.items():
+            metric_summary = summarize_peer_averages(rows)
+            averages[metric] = metric_summary[metric]
+            averages[f"{metric}_valid_count"] = metric_summary[f"{metric}_valid_count"]
+            averages[f"{metric}_baseline_noisy"] = metric_summary[f"{metric}_baseline_noisy"]
+        averages["valuation_baseline_mode"] = baseline_mode
+        averages["peer_baseline_insufficient"] = len(usable_rows) < minimum_usable_peers
+        averages["peer_baseline_reliability"] = "high" if len(usable_rows) >= self.peer_target_count else "medium" if len(usable_rows) >= minimum_usable_peers else "low"
 
-        company_pe = self._pe_ratio(yahoo, edgar)
-        company_pb = self._pb_ratio(yahoo, edgar)
-        neutral_used = False
-        if averages.get("pe_ratio") is None or averages.get("pe_ratio_valid_count", 0) < 2:
-            averages["pe_ratio"] = company_pe
+        if averages.get("pe_ratio") is None or averages.get("pe_ratio_valid_count", 0) < minimum_usable_peers:
+            averages["pe_ratio"] = None
             averages["pe_ratio_baseline_noisy"] = True
-            neutral_used = neutral_used or company_pe is not None
-        if averages.get("pb_ratio") is None or averages.get("pb_ratio_valid_count", 0) < 2:
-            averages["pb_ratio"] = company_pb
+        if averages.get("pb_ratio") is None or averages.get("pb_ratio_valid_count", 0) < minimum_usable_peers:
+            averages["pb_ratio"] = None
             averages["pb_ratio_baseline_noisy"] = True
-            neutral_used = neutral_used or company_pb is not None
-        if neutral_used:
-            averages["valuation_baseline_mode"] = "neutral"
         return averages
+
+    def _is_mega_cap_tech_company(self, ticker: str | None) -> bool:
+        return str(ticker or "").upper() in {"AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"}
 
     def _market_cap_bln(self, yahoo: dict, edgar: dict) -> float | None:
         price = yahoo.get("current_price")
@@ -688,24 +947,34 @@ class AnalysisService:
             return round_or_none(growth_pct, 2)
         return None
 
-    def _build_weighted_scores(self, metrics: dict, macro: dict) -> dict[str, tuple[float, float, str]]:
+    def _build_weighted_scores(self, metrics: dict, macro: dict) -> dict[str, tuple[float | None, float, str]]:
         weights = self.scoring_config["weights"]
         caps = self.scoring_config["caps"]
+        valuation_enabled = bool(metrics.get("valuation_enabled", True))
+        effective_roe_pct = metrics.get("roe_score_pct", metrics.get("roe_pct"))
 
         profitability_components = [
-            (score_positive(metrics["roe_pct"], caps["roe_pct"]), 0.4),
+            (score_positive(effective_roe_pct, caps["roe_pct"]), 0.4),
             (score_positive(metrics["roic_pct"], caps["roic_pct"]), 0.35),
             (score_positive(metrics["ebit_margin_pct"], caps["ebit_margin_pct"]), 0.25),
         ]
-        stability_components = [] if metrics.get("is_bank_like") else [
+        stability_components = [
             (score_inverse(metrics["debt_to_equity"], caps["debt_to_equity"]), 0.55),
             (score_positive(metrics["current_ratio"], caps["current_ratio"]), 0.20),
             (score_positive(metrics["fcf_margin_pct"], caps["fcf_margin_pct"]), 0.25),
         ]
-        valuation_components = [
-            (score_relative_valuation(metrics["pe_premium_pct"], caps["pe_premium_pct"]), 0.55),
-            (score_relative_valuation(metrics["pb_premium_pct"], caps["pb_premium_pct"]), 0.45),
-        ]
+        if metrics.get("is_bank_like"):
+            stability_components = [
+                (score_positive(effective_roe_pct, caps["roe_pct"]), 0.55),
+                (score_positive(metrics["revenue_growth_pct"], caps["revenue_growth_pct"]), 0.25),
+                (None, 0.20),
+            ]
+        valuation_components: list[tuple[float | None, float]] = []
+        if valuation_enabled:
+            valuation_components = [
+                (score_relative_valuation(metrics["pe_premium_pct"], caps["pe_premium_pct"]), 0.55),
+                (score_relative_valuation(metrics["pb_premium_pct"], caps["pb_premium_pct"]), 0.45),
+            ]
         growth_components = [
             (score_positive(metrics["revenue_growth_pct"], caps["revenue_growth_pct"]), 0.55),
             (score_positive(metrics["revenue_cagr_like_pct"], caps["revenue_growth_pct"]), 0.20),
@@ -737,9 +1006,13 @@ class AnalysisService:
             "macro": macro_score,
         }
         weighted_config = {
-            "profitability": weights["profitability"] * coverage_ratio(profitability_components),
+            "profitability": weights["profitability"]
+            * coverage_ratio(profitability_components)
+            * float(metrics.get("profitability_reliability_multiplier", 1.0)),
             "stability": weights["stability"] * coverage_ratio(stability_components),
-            "valuation": weights["valuation"] * coverage_ratio(valuation_components),
+            "valuation": weights["valuation"]
+            * coverage_ratio(valuation_components)
+            * float(metrics.get("peer_confidence_multiplier", 1.0)),
             "growth": weights["growth"] * coverage_ratio(growth_components),
             "market": weights["market"] * coverage_ratio(market_components),
             "macro": weights["macro"] * coverage_ratio(macro_components),
@@ -747,26 +1020,28 @@ class AnalysisService:
         effective_weights = normalize_weights(block_scores, weighted_config)
 
         return {
-            "profitability": (round(profitability or 0.0, 2), effective_weights["profitability"], "Высокие ROE, ROIC и операционная маржа поддерживают качество бизнеса."),
-            "stability": (round(stability or 0.0, 2), effective_weights["stability"], "Смотрим долговую нагрузку, ликвидность и запас денежного потока."),
-            "valuation": (round(valuation or 0.0, 2), effective_weights["valuation"], "Оцениваем премию или дисконт по P/E и P/B против peer-group."),
-            "growth": (round(growth or 0.0, 2), effective_weights["growth"], "Учитываем рост выручки, ее динамику и качество FCF."),
-            "market": (round(market or 0.0, 2), effective_weights["market"], "Рыночный импульс учитывает доходность цены за 1 и 5 лет."),
-            "macro": (round(macro_score or 0.0, 2), effective_weights["macro"], "Макросреда корректирует оценку с учетом ставок, инфляции и роста экономики."),
+            "profitability": (round_or_none(profitability, 2), effective_weights["profitability"], "Высокие ROE, ROIC и операционная маржа поддерживают качество бизнеса."),
+            "stability": (round_or_none(stability, 2), effective_weights["stability"], "Смотрим долговую нагрузку, ликвидность и запас денежного потока."),
+            "valuation": (round_or_none(valuation, 2), effective_weights["valuation"], "Оцениваем премию или дисконт по P/E и P/B против peer-group."),
+            "growth": (round_or_none(growth, 2), effective_weights["growth"], "Учитываем рост выручки, ее динамику и качество FCF."),
+            "market": (round_or_none(market, 2), effective_weights["market"], "Рыночный импульс учитывает доходность цены за 1 и 5 лет."),
+            "macro": (round_or_none(macro_score, 2), effective_weights["macro"], "Макросреда корректирует оценку с учетом ставок, инфляции и роста экономики."),
         }
 
     def _metric_cards(self, metrics: dict, peers: dict) -> list[MetricCard]:
+        valuation_enabled = bool(metrics.get("valuation_enabled", True))
+        pe_benchmark = peers["pe_ratio"] if valuation_enabled else None
         return [
             MetricCard(
                 label="Коэффициент P/E (Price/Earnings)",
                 value=round_or_none(metrics["pe_ratio"], 2),
-                benchmark=round_or_none(peers["pe_ratio"], 2),
+                benchmark=round_or_none(pe_benchmark, 2),
                 direction="lower_better",
                 display_value=self._display_metric(metrics["pe_ratio"]),
-                display_benchmark=self._display_metric(peers["pe_ratio"]),
+                display_benchmark=self._display_metric(pe_benchmark),
                 comparison_label=self._comparison_label(
                     metrics["pe_ratio"],
-                    peers["pe_ratio"],
+                    pe_benchmark,
                     "lower_better",
                     metrics.get("peer_pe_valid_count", 3),
                     bool(metrics.get("peer_pe_noisy", False)) or metrics.get("peer_selection_confidence") == "low",
@@ -786,7 +1061,9 @@ class AnalysisService:
                     peers["roe_pct"],
                     "higher_better",
                     metrics.get("peer_roe_valid_count", 3),
-                    bool(metrics.get("peer_roe_noisy", False)) or metrics.get("peer_selection_confidence") == "low",
+                    bool(metrics.get("peer_roe_noisy", False))
+                    or metrics.get("peer_selection_confidence") == "low"
+                    or not bool(metrics.get("roe_reliable", True)),
                 ),
                 description="Показывает, насколько эффективно компания генерирует прибыль на капитал акционеров.",
             ),
@@ -835,7 +1112,7 @@ class AnalysisService:
                 score=round(
                     weighted_score(
                         [
-                            (score_positive(item["roe_pct"], 50), 0.4),
+                            (score_positive(item.get("roe_score_pct", item["roe_pct"]), 50), 0.4),
                             (score_positive(item["revenue_growth_pct"], 35), 0.35),
                             (score_inverse(item["pe_ratio"], 60), 0.25),
                         ]
@@ -843,7 +1120,7 @@ class AnalysisService:
                     or 0.0,
                     1,
                 ),
-                market_cap_bln=round(item["market_cap_bln"] or 0.0, 2),
+                market_cap_bln=round_or_none(item["market_cap_bln"], 2),
                 pe_ratio=round_or_none(item["pe_ratio"], 2),
                 roe_pct=round_or_none(item["roe_pct"], 2),
                 revenue_growth_pct=round_or_none(item["revenue_growth_pct"], 2),
@@ -858,6 +1135,13 @@ class AnalysisService:
         inflation_value = macro.get("inflation_pct")
         unemployment_value = macro.get("unemployment_pct")
         gdp_value = macro.get("gdp_growth_pct")
+        if fed_value is None and inflation_value is None and unemployment_value is None:
+            return [
+                (None, 0.30),
+                (None, 0.25),
+                (None, 0.20),
+                (None, 0.25),
+            ], None
         components = [
             (max(0.0, 100 - (fed_value * 12)) if fed_value is not None else None, 0.30),
             (max(0.0, 100 - (abs(inflation_value - 2.0) * 25)) if inflation_value is not None else None, 0.25),
@@ -873,7 +1157,7 @@ class AnalysisService:
         weighted_scores: dict[str, tuple[float, float, str]],
         warnings: list[str] | None = None,
     ) -> str:
-        eligible = [(key, item) for key, item in weighted_scores.items() if item[1] > 0]
+        eligible = [(key, item) for key, item in weighted_scores.items() if item[1] > 0 and item[0] is not None]
         strongest = max(eligible, key=lambda item: item[1][0] * item[1][1]) if eligible else next(iter(weighted_scores.items()))
         weakest = min(eligible, key=lambda item: item[1][0] * item[1][1]) if eligible else next(iter(weighted_scores.items()))
         narrative = (
@@ -901,10 +1185,20 @@ class AnalysisService:
             return "Нейтрально"
         is_positive = value >= benchmark if direction == "higher_better" else value <= benchmark
         return "Лучше peers" if is_positive else "Слабее peers"
-    def _build_data_quality_warnings(self, edgar: dict, macro: dict, peers: dict, is_bank_like: bool) -> list[str]:
+    def _build_data_quality_warnings(
+        self,
+        edgar: dict,
+        macro: dict,
+        peers: dict,
+        is_bank_like: bool,
+        metrics: dict | None = None,
+    ) -> list[str]:
         warnings: list[str] = []
         if edgar.get("equity_bln") is not None and edgar.get("equity_bln") <= 0:
             warnings.append("Negative equity detected: ROE, Debt/Equity and P/B may be unreliable")
+        if metrics and not metrics.get("roe_reliable", True):
+            reason = metrics.get("roe_reliability_reason") or "ROE was de-emphasized"
+            warnings.append(f"ROE reliability warning: {reason}")
         revenue_history = edgar.get("revenue_bln", [])
         if len(revenue_history) >= 2:
             ratio = safe_ratio(revenue_history[0], revenue_history[1])
@@ -916,58 +1210,44 @@ class AnalysisService:
             macro.get("inflation_pct"),
             macro.get("unemployment_pct"),
         ]
-        if any(value is None for value in fred_missing):
-            warnings.append("FRED data unavailable: macro score calculated on partial data")
-        if any(
-            peers.get(key, 0) < 3
-            for key in (
-                "pe_ratio_valid_count",
-                "pb_ratio_valid_count",
-                "roe_pct_valid_count",
-                "revenue_growth_pct_valid_count",
-            )
-        ):
-            warnings.append("Peer baseline is sparse or affected by outliers; comparative valuation may be noisy")
-        if any(peers.get(key, False) for key in ("pe_ratio_baseline_noisy", "pb_ratio_baseline_noisy")):
-            warnings.append("Low-confidence valuation comparison: peer baseline is noisy")
-        if peers.get("peer_selection_confidence") == "low":
-            warnings.append("Peer baseline is noisy or based on fallback selection")
-            warnings.append("Low-confidence peer comparison")
-        if peers.get("peer_group_sample_limited"):
-            warnings.append("Peer comparison based on limited peer set")
-            warnings.append("Peer averages computed from small sample size")
+        if all(value is None for value in fred_missing):
+            warnings.append("Macro disabled: FRED data unavailable, so macro weight was redistributed")
+        elif any(value is None for value in fred_missing):
+            warnings.append("Macro incomplete: FRED data unavailable, so macro score uses partial inputs")
+
+        peer_reasons: list[str] = []
         if peers.get("peer_selection_mode") == "extended":
-            warnings.append("Peer group was downgraded to extended mode due to weak strict peer match")
+            peer_reasons.append("extended peer mode")
         if peers.get("peer_selection_mode") == "fallback":
-            warnings.append("Low-confidence peer group: fallback basket was used")
+            peer_reasons.append("fallback basket")
+        if peers.get("peer_group_sample_limited"):
+            peer_reasons.append("small sample")
+        if any(peers.get(key, 0) < 3 for key in ("pe_ratio_valid_count", "pb_ratio_valid_count", "roe_pct_valid_count", "revenue_growth_pct_valid_count")):
+            peer_reasons.append("sparse baseline")
+        if any(peers.get(key, False) for key in ("pe_ratio_baseline_noisy", "pb_ratio_baseline_noisy")):
+            peer_reasons.append("noisy valuation baseline")
+        if peers.get("peer_baseline_insufficient"):
+            peer_reasons.append("direct peer comparison insufficient")
+        if peers.get("valuation_baseline_mode") == "thematic":
+            peer_reasons.append("thematic median used")
+        if peers.get("valuation_baseline_mode") == "fallback":
+            peer_reasons.append("fallback basket median used")
         if peers.get("valuation_baseline_mode") == "neutral":
-            warnings.append("Valuation used neutral baseline because usable peer valuation data was insufficient")
-        if peers.get("peer_expansion_level", 0) >= 2:
-            warnings.append("Peer set expanded using lower-confidence candidates within same business type")
-        if 0 < peers.get("peer_count", 0) < peers.get("target_peer_count", self.peer_target_count):
-            warnings.append("Peer target count was not reached; comparison is based on partial peer universe")
-        if peers.get("peer_selection_source") == "business_type":
-            warnings.append("Peer selection used business-type fallback universe")
-        if peers.get("peer_selection_source") in {"fmp", "finnhub"}:
-            warnings.append("Peers were selected via external API and filtered locally")
-        if peers.get("peer_selection_source") == "config":
-            warnings.append("Peer baseline used fallback source due to insufficient API peers")
-            if peers.get("peer_selection_confidence") == "low":
-                warnings.append("Peer selection used broad fallback because no reliable API peers were found")
-        if peers.get("peer_group_quality_passed") is False:
-            warnings.append("No reliable peers found within inferred business type")
-            warnings.append("Comparative metrics were downgraded due to weak peer relevance")
-            if peers.get("peer_selection_source") == "config":
-                warnings.append("Broad fallback peers were rejected for scoring use")
+            peer_reasons.append("neutral valuation baseline")
+        if peers.get("peer_count_usable", 0) < 3:
+            warnings.append("Usable peer set too small (<3); valuation was disabled")
+        if peers.get("peer_selection_confidence") == "low" or peer_reasons:
+            warnings.append(f"Peer low confidence: {', '.join(dict.fromkeys(peer_reasons or ['limited relevance']))}")
+
         if any(
             peers.get(key, 0) == 0
             for key in ("pe_ratio_valid_count", "pb_ratio_valid_count", "roe_pct_valid_count", "debt_to_equity_valid_count")
         ):
-            warnings.append("Some peer metrics were excluded due to invalid or non-interpretable values")
+            warnings.append("Incomplete fundamentals: some peer metrics were excluded as invalid or non-interpretable")
         if peers.get("incompatible_peer_count", 0) > 0:
-            warnings.append("Some peers were excluded due to incompatible business models")
+            warnings.append("Peer cleanup applied: incompatible business models were excluded")
         if is_bank_like:
-            warnings.append("Bank-specific scoring rules were applied; some generic corporate metrics were excluded")
+            warnings.append("Sector-specific fallback applied: bank-safe stability logic replaced generic debt/FCF rules")
         if peers.get("business_type_confidence") in {"medium", "low"}:
             warnings.append("Business type was inferred from rule-based classification")
         return warnings
@@ -975,8 +1255,8 @@ class AnalysisService:
     def _is_bank_like(self, company_profile: dict) -> bool:
         return is_bank_like_company(company_profile.get("sector"), company_profile.get("industry"))
     def _build_completeness_warnings(self, metrics: dict, macro: dict) -> list[str]:
-        profitability_components = [metrics.get("roe_pct"), metrics.get("roic_pct"), metrics.get("ebit_margin_pct")]
-        stability_components = [] if metrics.get("is_bank_like") else [metrics.get("debt_to_equity"), metrics.get("current_ratio"), metrics.get("fcf_margin_pct")]
+        profitability_components = [metrics.get("roe_score_pct"), metrics.get("roic_pct"), metrics.get("ebit_margin_pct")]
+        stability_components = [metrics.get("roe_score_pct"), metrics.get("revenue_growth_pct"), None] if metrics.get("is_bank_like") else [metrics.get("debt_to_equity"), metrics.get("current_ratio"), metrics.get("fcf_margin_pct")]
         valuation_components = [metrics.get("pe_premium_pct"), metrics.get("pb_premium_pct")]
         growth_components = [metrics.get("revenue_growth_pct"), metrics.get("revenue_cagr_like_pct")]
         if not metrics.get("is_bank_like"):
@@ -998,6 +1278,10 @@ class AnalysisService:
             warnings.append("Some block scores were capped due to incomplete data")
         if any(0 < coverage < 0.5 for coverage in coverages.values()):
             warnings.append("Low data completeness detected: some block scores were capped conservatively")
+        if metrics.get("data_completeness_score") is not None and metrics["data_completeness_score"] < 75:
+            warnings.append("Data completeness score is low; several metrics were excluded from scoring")
+        if metrics.get("data_reliability_score") is not None and metrics["data_reliability_score"] < 75:
+            warnings.append("Data reliability score is low; peer confidence and metric quality reduced block weights")
         return warnings
     def _dedupe_warnings(self, warnings: list[str]) -> list[str]:
         seen: set[str] = set()

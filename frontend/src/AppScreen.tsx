@@ -1,8 +1,8 @@
 import { FormEvent, useEffect, useState } from "react";
 
-import { BreakdownBarsRu } from "./components/BreakdownBarsRu";
+import { BreakdownBarsRuSafe } from "./components/BreakdownBarsRuSafe";
 import { MacroPanelRu } from "./components/MacroPanelRu";
-import { MetricGridRu } from "./components/MetricGridRu";
+import { MetricGridRuSafe } from "./components/MetricGridRuSafe";
 import { PeerTableRu } from "./components/PeerTableRu";
 import { PriceChartRu } from "./components/PriceChartRu";
 import { ScoreRingRu } from "./components/ScoreRingRu";
@@ -97,10 +97,10 @@ export default function AppScreen() {
 
       {data && (
         <>
-          <MetricGridRu items={data.metric_cards} />
+          <MetricGridRuSafe items={data.metric_cards} />
 
           <section className="dashboard-grid">
-            <BreakdownBarsRu items={data.score_breakdown} />
+            <BreakdownBarsRuSafe items={data.score_breakdown} />
             <MacroPanelRu items={data.macro} />
           </section>
 

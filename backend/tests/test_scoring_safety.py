@@ -5,6 +5,10 @@ import sys
 import types
 import unittest
 
+import httpx
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 sqlalchemy_module = types.ModuleType("sqlalchemy")
@@ -16,6 +20,8 @@ sys.modules.setdefault("sqlalchemy.orm", sqlalchemy_orm_module)
 
 database_module = types.ModuleType("app.core.database")
 database_module.SessionLocal = lambda: None
+database_module.Base = types.SimpleNamespace(metadata=types.SimpleNamespace(create_all=lambda bind=None: None))
+database_module.engine = object()
 sys.modules.setdefault("app.core.database", database_module)
 
 repository_module = types.ModuleType("app.repositories.analysis_repository")
@@ -30,10 +36,13 @@ repository_module.AnalysisRepository = _DummyRepository
 sys.modules.setdefault("app.repositories.analysis_repository", repository_module)
 
 from app.core.scoring import get_scoring_config
+from app.core.request_context import get_correlation_id
+from app.api import routes
+from app.middleware.request_context import correlation_id_middleware
 from app.schemas.analysis import AnalysisResponse
 from app.services.analysis_runtime_service import AnalysisService
-from app.services.analysis_safety import business_type_compatibility, classify_company, is_bank_like_company, safe_ratio
-from app.services.providers.live_clients import summarize_peer_averages
+from app.services.analysis_safety import business_type_compatibility, classify_company, is_bank_like_company, normalize_weights, safe_ratio
+from app.services.providers.live_clients import BaseHttpProvider, SecEdgarProvider, _safe_number, _series_latest, summarize_peer_averages
 from app.services.providers.peer_providers import PeerCandidate, PeerDiscoveryResult
 
 
@@ -71,6 +80,274 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertEqual(business_type_compatibility("RESTAURANTS", "RETAIL"), "WEAK")
         self.assertEqual(business_type_compatibility("REIT", "REIT"), "STRICT")
         self.assertEqual(business_type_compatibility("CONSUMER_HARDWARE_ECOSYSTEM", "SEMICONDUCTORS"), "RELATED")
+
+    def test_business_type_compatibility_unknown_is_weak(self) -> None:
+        self.assertEqual(business_type_compatibility("UNKNOWN", "BANK"), "WEAK")
+        self.assertEqual(business_type_compatibility("OTHER", "INDUSTRIALS"), "WEAK")
+
+    def test_live_client_missing_values_stay_none(self) -> None:
+        self.assertIsNone(_safe_number(None))
+        self.assertIsNone(_safe_number("not-a-number"))
+        self.assertIsNone(_series_latest([]))
+
+    def test_http_provider_does_not_disable_ssl_verification(self) -> None:
+        captured: dict[str, object] = {}
+        original_client = httpx.Client
+
+        class _FakeClient:
+            def __init__(self, **kwargs) -> None:
+                captured["client_kwargs"] = kwargs
+
+            def get(self, url: str, **kwargs):
+                captured["url"] = url
+                captured["request_kwargs"] = kwargs
+
+                class _Response:
+                    def raise_for_status(self) -> None:
+                        return None
+
+                    def json(self) -> dict:
+                        return {"ok": True}
+
+                return _Response()
+
+            def close(self) -> None:
+                return None
+
+        try:
+            httpx.Client = _FakeClient
+            provider = BaseHttpProvider()
+            payload = provider._get_json("https://www.sec.gov/files/company_tickers.json")
+        finally:
+            httpx.Client = original_client
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(captured["client_kwargs"]["verify"], True)
+        self.assertNotIn("verify", captured["request_kwargs"])
+
+    def test_correlation_id_middleware_sets_header_and_context(self) -> None:
+        app = FastAPI()
+        app.middleware("http")(correlation_id_middleware)
+
+        @app.get("/cid")
+        def correlation_id_view() -> dict[str, str | None]:
+            return {"correlation_id": get_correlation_id()}
+
+        client = TestClient(app)
+        response = client.get("/cid", headers={"X-Correlation-ID": "req-123"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["X-Correlation-ID"], "req-123")
+        self.assertEqual(response.json()["correlation_id"], "req-123")
+
+    def test_sec_provider_aligns_fcf_by_period_and_computes_roic(self) -> None:
+        provider = SecEdgarProvider()
+        provider._ticker_to_cik = lambda ticker: "0000000001"
+
+        facts = {
+            "entityName": "Test Corp",
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {"units": {"USD": [
+                        {"fy": 2024, "end": "2024-12-31", "form": "10-K", "fp": "FY", "val": 130_000_000_000},
+                        {"fy": 2023, "end": "2023-12-31", "form": "10-K", "fp": "FY", "val": 120_000_000_000},
+                    ]}},
+                    "NetCashProvidedByUsedInOperatingActivities": {"units": {"USD": [
+                        {"fy": 2023, "end": "2023-12-31", "form": "10-K", "fp": "FY", "val": 30_000_000_000},
+                    ]}},
+                    "PaymentsToAcquirePropertyPlantAndEquipment": {"units": {"USD": [
+                        {"fy": 2023, "end": "2023-12-31", "form": "10-K", "fp": "FY", "val": 5_000_000_000},
+                    ]}},
+                    "StockholdersEquity": {"units": {"USD": [{"end": "2024-12-31", "form": "10-K", "val": 50_000_000_000}]}},
+                    "Liabilities": {"units": {"USD": [{"end": "2024-12-31", "form": "10-K", "val": 70_000_000_000}]}},
+                    "LongTermDebt": {"units": {"USD": [{"end": "2024-12-31", "form": "10-K", "val": 20_000_000_000}]}},
+                    "LongTermDebtCurrent": {"units": {"USD": [{"end": "2024-12-31", "form": "10-K", "val": 5_000_000_000}]}},
+                    "CashAndCashEquivalentsAtCarryingValue": {"units": {"USD": [{"end": "2024-12-31", "form": "10-K", "val": 10_000_000_000}]}},
+                    "OperatingIncomeLoss": {"units": {"USD": [{"fy": 2024, "end": "2024-12-31", "form": "10-K", "fp": "FY", "val": 25_000_000_000}]}},
+                    "IncomeBeforeTaxExpenseBenefit": {"units": {"USD": [{"fy": 2024, "end": "2024-12-31", "form": "10-K", "fp": "FY", "val": 20_000_000_000}]}},
+                    "IncomeTaxExpenseBenefit": {"units": {"USD": [{"fy": 2024, "end": "2024-12-31", "form": "10-K", "fp": "FY", "val": 4_000_000_000}]}},
+                    "NetIncomeLoss": {"units": {"USD": [{"fy": 2024, "end": "2024-12-31", "form": "10-K", "fp": "FY", "val": 16_000_000_000}]}},
+                    "Assets": {"units": {"USD": [{"end": "2024-12-31", "form": "10-K", "val": 120_000_000_000}]}},
+                },
+                "dei": {
+                    "EntityCommonStockSharesOutstanding": {"units": {"shares": [{"end": "2024-12-31", "form": "10-K", "val": 1_000_000_000}]}}
+                },
+            },
+        }
+        submissions = {"name": "Test Corp", "sic": "7372", "sicDescription": "Software"}
+
+        provider._get_json = lambda url, params=None, headers=None: facts if "companyfacts" in url else submissions
+        result = provider.fetch_company_bundle("TEST")
+
+        self.assertIsNone(result.payload["history"][0]["free_cash_flow_bln"])
+        self.assertEqual(result.payload["history"][1]["free_cash_flow_bln"], 25.0)
+        self.assertIsNone(result.payload["fcf_margin_pct"])
+        self.assertAlmostEqual(result.payload["roic_pct"], 30.77, places=2)
+        self.assertTrue(any("FCF" in warning for warning in result.warnings))
+
+    def test_ticker_normalization_rejects_non_alphanumeric_input(self) -> None:
+        with self.assertRaises(ValueError):
+            self.service._normalize_ticker("AAPL;DROP TABLE")
+
+        self.assertEqual(self.service._normalize_ticker(" msft "), "MSFT")
+
+    def test_analyze_route_returns_504_for_timeout(self) -> None:
+        app = FastAPI()
+        app.include_router(routes.router)
+        client = TestClient(app)
+        original_analyze = routes.service.analyze
+
+        try:
+            routes.service.analyze = lambda ticker: (_ for _ in ()).throw(httpx.ReadTimeout("upstream timeout"))
+            response = client.get("/analyze/MSFT")
+        finally:
+            routes.service.analyze = original_analyze
+
+        self.assertEqual(response.status_code, 504)
+        self.assertTrue(response.json()["detail"])
+
+    def test_analyze_route_rejects_invalid_ticker_path(self) -> None:
+        app = FastAPI()
+        app.include_router(routes.router)
+        client = TestClient(app)
+
+        response = client.get("/analyze/MSFT;DROP")
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_analyze_route_maps_keyerror_to_404(self) -> None:
+        app = FastAPI()
+        app.include_router(routes.router)
+        client = TestClient(app)
+        original_analyze = routes.service.analyze
+
+        try:
+            routes.service.analyze = lambda ticker: (_ for _ in ()).throw(KeyError("missing ticker"))
+            response = client.get("/analyze/MISSING")
+        finally:
+            routes.service.analyze = original_analyze
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_analyze_route_maps_http_error_to_502(self) -> None:
+        app = FastAPI()
+        app.include_router(routes.router)
+        client = TestClient(app)
+        original_analyze = routes.service.analyze
+
+        try:
+            routes.service.analyze = lambda ticker: (_ for _ in ()).throw(httpx.HTTPStatusError("bad gateway", request=None, response=None))
+            response = client.get("/analyze/MSFT")
+        finally:
+            routes.service.analyze = original_analyze
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_normalize_weights_sum_stays_one_for_incomplete_blocks(self) -> None:
+        weights = normalize_weights(
+            {
+                "profitability": 80.0,
+                "stability": 60.0,
+                "valuation": 55.0,
+                "growth": 70.0,
+                "market": 50.0,
+                "macro": None,
+            },
+            {
+                "profitability": 0.27,
+                "stability": 0.24,
+                "valuation": 0.16,
+                "growth": 0.18,
+                "market": 0.10,
+                "macro": 0.05,
+            },
+        )
+
+        self.assertAlmostEqual(sum(weights.values()), 1.0, places=8)
+        self.assertEqual(weights["macro"], 0.0)
+
+    def test_revenue_cagr_like_uses_multi_year_compound_growth(self) -> None:
+        metrics = self.service._build_silver_metrics(
+            {"current_price": 100.0, "one_year_return_pct": 0.0, "five_year_return_pct": 0.0},
+            {
+                "revenue_bln": [121.0, 110.0, 100.0],
+                "net_income_bln": 10.0,
+                "equity_bln": 50.0,
+                "shares_outstanding_mln": 1000.0,
+            },
+            {
+                "pe_ratio": 15.0,
+                "pb_ratio": 3.0,
+                "roe_pct": 12.0,
+                "revenue_growth_pct": 8.0,
+                "debt_to_equity": 0.8,
+            },
+        )
+
+        self.assertAlmostEqual(metrics["revenue_cagr_like_pct"], 10.0, places=2)
+
+    def test_analysis_uses_cached_response_for_second_call(self) -> None:
+        class FakeCache:
+            def __init__(self) -> None:
+                self.items: dict[str, AnalysisResponse] = {}
+
+            def get(self, key: str) -> AnalysisResponse | None:
+                return self.items.get(key)
+
+            def set(self, key: str, value: AnalysisResponse) -> None:
+                self.items[key] = value
+
+        class Provider:
+            def __init__(self, payload: dict, source_name: str) -> None:
+                self.payload = payload
+                self.source_name = source_name
+                self.warnings: list[str] = []
+                self.calls = 0
+
+            def fetch_company_bundle(self, ticker: str):
+                self.calls += 1
+                return types.SimpleNamespace(payload=self.payload, warnings=[])
+
+            def fetch_macro_bundle(self):
+                self.calls += 1
+                return types.SimpleNamespace(payload=self.payload, warnings=[])
+
+        cached_service = AnalysisService.__new__(AnalysisService)
+        cached_service.scoring_config = get_scoring_config()
+        cached_service.analysis_cache = FakeCache()
+        cached_service.peer_group_cache = FakeCache()
+        cached_service.peer_target_count = 6
+        cached_service.peer_min_valid_count = 3
+        cached_service.yahoo = Provider({"company": "Test Corp", "current_price": 100.0, "one_year_return_pct": 5.0, "five_year_return_pct": 15.0, "price_history": []}, "Yahoo")
+        cached_service.edgar = Provider({"company": "Test Corp", "sector": "Technology", "industry": "Software", "sic": "7372", "history": [], "revenue_bln": [110.0, 100.0], "net_income_bln": 10.0, "equity_bln": 50.0, "shares_outstanding_mln": 1000.0}, "EDGAR")
+        cached_service.fred = Provider({"fed_funds_rate_pct": 4.0, "inflation_pct": 3.0, "unemployment_pct": 4.0}, "FRED")
+        cached_service.world_bank = Provider({"gdp_growth_pct": 2.0}, "World Bank")
+        cached_service._is_bank_like = lambda company_profile: False
+        cached_service._build_peer_group = lambda company_profile, yahoo, edgar: ([], {"peer_selection_confidence": "low", "peer_selection_reason": "test", "peer_count": 0})
+        cached_service._build_peer_averages = lambda peers, peer_selection, yahoo, edgar: {"pe_ratio": None, "pb_ratio": None, "roe_pct": None, "revenue_growth_pct": None, "debt_to_equity": None}
+        cached_service._build_silver_metrics = lambda yahoo, edgar, peers, is_bank_like: {"pe_ratio": None, "pb_ratio": None, "roe_pct": None, "roic_pct": None, "ebit_margin_pct": None, "revenue_growth_pct": None, "revenue_cagr_like_pct": None, "fcf_margin_pct": None, "debt_to_equity": None, "current_ratio": None, "one_year_return_pct": 5.0, "five_year_return_pct": 15.0, "pe_premium_pct": None, "pb_premium_pct": None, "is_bank_like": False}
+        cached_service._build_data_quality_warnings = lambda edgar, macro, peers, is_bank_like, metrics=None: []
+        cached_service._build_completeness_warnings = lambda silver_metrics, macro: []
+        cached_service._build_weighted_scores = lambda silver_metrics, macro: {
+            "valuation": (0.0, 0.0, "missing"),
+            "macro": (50.0, 1.0, "ok"),
+        }
+        cached_service._verdict = lambda total_score: "Neutral"
+        cached_service._dedupe_warnings = lambda warnings: warnings
+        cached_service._build_narrative = lambda company, total_score, weighted_scores, warnings: "Test narrative"
+        cached_service._metric_cards = lambda silver_metrics, peer_averages: []
+        cached_service._peer_rows = lambda peers: []
+        cached_service._persist_layers = lambda *args, **kwargs: None
+
+        first = cached_service.analyze("test")
+        second = cached_service.analyze("test")
+
+        self.assertEqual(first.model_dump(), second.model_dump())
+        self.assertIsNone(next(item for item in first.score_breakdown if item.key == "valuation").score)
+        self.assertEqual(cached_service.yahoo.calls, 1)
+        self.assertEqual(cached_service.edgar.calls, 1)
+        self.assertEqual(cached_service.fred.calls, 1)
+        self.assertEqual(cached_service.world_bank.calls, 1)
 
     def test_negative_equity_metrics_become_none(self) -> None:
         edgar = {
@@ -137,6 +414,7 @@ class ScoringSafetyTests(unittest.TestCase):
         weighted_scores = self.service._build_weighted_scores(
             {
                 "roe_pct": 20.0,
+                "roe_score_pct": 20.0,
                 "roic_pct": 20.0,
                 "ebit_margin_pct": 20.0,
                 "debt_to_equity": 1.0,
@@ -159,8 +437,62 @@ class ScoringSafetyTests(unittest.TestCase):
         )
 
         macro_score, macro_weight, _ = weighted_scores["macro"]
-        self.assertEqual(macro_score, 50.0)
-        self.assertLess(macro_weight, self.service.scoring_config["weights"]["macro"])
+        self.assertIsNone(macro_score)
+        self.assertEqual(macro_weight, 0.0)
+
+    def test_aapl_low_equity_roe_falls_back_to_roic_for_scoring(self) -> None:
+        metrics = self.service._build_silver_metrics(
+            {
+                "current_price": 210.0,
+                "one_year_return_pct": 12.0,
+                "five_year_return_pct": 180.0,
+            },
+            {
+                "revenue_bln": [390.0, 380.0, 365.0],
+                "net_income_bln": 100.0,
+                "equity_bln": 60.0,
+                "roic_pct": 31.0,
+                "ebit_margin_pct": 32.0,
+                "fcf_margin_pct": 25.0,
+                "debt_to_equity": 1.8,
+                "current_ratio": 1.0,
+                "shares_outstanding_mln": 15500.0,
+            },
+            {
+                "pe_ratio": 30.0,
+                "pb_ratio": 8.0,
+                "roe_pct": 28.0,
+                "revenue_growth_pct": 12.0,
+                "debt_to_equity": 0.6,
+                "pe_ratio_valid_count": 4,
+                "pb_ratio_valid_count": 4,
+                "peer_count_usable": 4,
+                "peer_confidence": "high",
+                "peer_baseline_reliability": "high",
+            },
+        )
+
+        self.assertFalse(metrics["roe_reliable"])
+        self.assertGreater(metrics["roe_pct"], 100.0)
+        self.assertEqual(metrics["roe_score_pct"], 31.0)
+        self.assertGreaterEqual(metrics["data_completeness_score"], 80.0)
+        self.assertLess(metrics["data_reliability_score"], 100.0)
+
+        weighted_scores = self.service._build_weighted_scores(
+            metrics
+            | {
+                "pe_premium_pct": 5.0,
+                "pb_premium_pct": 10.0,
+            },
+            {
+                "fed_funds_rate_pct": 4.0,
+                "inflation_pct": 3.0,
+                "unemployment_pct": 4.0,
+                "gdp_growth_pct": 2.0,
+            },
+        )
+
+        self.assertLess(weighted_scores["profitability"][0], 85.0)
 
     def test_revenue_growth_requires_matching_period_metadata(self) -> None:
         growth = self.service._revenue_growth_pct(
@@ -217,8 +549,8 @@ class ScoringSafetyTests(unittest.TestCase):
         )
 
         self.assertEqual([row["ticker"] for row in selected[:2]], ["BAC", "WFC"])
-        self.assertIn(meta["peer_selection_confidence"], {"medium", "high"})
-        self.assertTrue(meta["peer_group_quality_passed"])
+        self.assertEqual(meta["peer_selection_confidence"], "low")
+        self.assertLess(meta["peer_count_usable"], 3)
 
     def test_business_type_peer_selection_rejects_irrelevant_uber_peers(self) -> None:
         selected, meta = self.service._select_peers_from_candidates(
@@ -240,7 +572,8 @@ class ScoringSafetyTests(unittest.TestCase):
         )
 
         self.assertEqual({row["ticker"] for row in selected}, {"ABNB", "DASH"})
-        self.assertTrue(meta["peer_group_quality_passed"])
+        self.assertFalse(meta["peer_group_quality_passed"])
+        self.assertLess(meta["peer_count_usable"], 3)
 
     def test_business_type_selection_keeps_insurance_separate_from_banks(self) -> None:
         selected, meta = self.service._select_peers_from_candidates(
@@ -262,7 +595,8 @@ class ScoringSafetyTests(unittest.TestCase):
         )
 
         self.assertEqual([row["ticker"] for row in selected[:2]], ["TRV", "ALL"])
-        self.assertTrue(meta["peer_group_quality_passed"])
+        self.assertFalse(meta["peer_group_quality_passed"])
+        self.assertLess(meta["peer_count_usable"], 3)
 
     def test_business_type_selection_prefers_hardware_over_enterprise_software_for_aapl(self) -> None:
         selected, meta = self.service._select_peers_from_candidates(
@@ -283,8 +617,63 @@ class ScoringSafetyTests(unittest.TestCase):
             ["HPQ", "DELL", "CRM", "NOW"],
         )
 
-        self.assertEqual([row["ticker"] for row in selected[:2]], ["DELL", "HPQ"])
-        self.assertTrue(meta["peer_group_quality_passed"])
+        self.assertEqual({row["ticker"] for row in selected[:2]}, {"DELL", "HPQ"})
+        self.assertFalse(meta["peer_group_quality_passed"])
+        self.assertLess(meta["peer_count_usable"], 3)
+
+    def test_meta_peer_selection_prefers_internet_platforms_over_crm(self) -> None:
+        selected, meta = self.service._select_peers_from_candidates(
+            {
+                "ticker": "META",
+                "sector": "Communication Services",
+                "industry": "Internet Content & Information",
+                "sic": "7375",
+                "business_type": "INTERNET_PLATFORM",
+                "revenue_bln_latest": 135.0,
+                "ebit_margin_pct": 40.0,
+            },
+            [
+                {"ticker": "GOOGL", "sector": "Communication Services", "industry": "Internet Content & Information", "sic": "7375", "market_cap_bln": 2000.0, "pe_ratio": 26.0, "pb_ratio": 7.0, "roe_pct": 30.0, "revenue_growth_pct": 12.0, "debt_to_equity": 0.1, "revenue_bln": 330.0, "ebit_margin_pct": 32.0},
+                {"ticker": "SNAP", "sector": "Communication Services", "industry": "Internet Content & Information", "sic": "7375", "market_cap_bln": 120.0, "pe_ratio": 24.0, "pb_ratio": 5.0, "roe_pct": 18.0, "revenue_growth_pct": 14.0, "debt_to_equity": 0.2, "revenue_bln": 8.0, "ebit_margin_pct": 24.0},
+                {"ticker": "PINS", "sector": "Communication Services", "industry": "Internet Content & Information", "sic": "7375", "market_cap_bln": 90.0, "pe_ratio": 22.0, "pb_ratio": 4.0, "roe_pct": 16.0, "revenue_growth_pct": 13.0, "debt_to_equity": 0.1, "revenue_bln": 4.0, "ebit_margin_pct": 22.0},
+                {"ticker": "CRM", "sector": "Technology", "industry": "Software - Application", "sic": "7372", "market_cap_bln": 260.0, "pe_ratio": 26.0, "pb_ratio": 4.0, "roe_pct": 12.0, "revenue_growth_pct": 9.0, "debt_to_equity": 0.2, "revenue_bln": 37.0, "ebit_margin_pct": 18.0},
+                {"ticker": "ORCL", "sector": "Technology", "industry": "Software - Infrastructure", "sic": "7372", "market_cap_bln": 380.0, "pe_ratio": 28.0, "pb_ratio": 30.0, "roe_pct": 20.0, "revenue_growth_pct": 8.0, "debt_to_equity": 5.0, "revenue_bln": 54.0, "ebit_margin_pct": 28.0},
+            ],
+            1500.0,
+            ["GOOGL", "SNAP", "PINS", "CRM", "ORCL"],
+        )
+
+        tickers = [row["ticker"] for row in selected[:3]]
+        self.assertEqual(set(tickers), {"GOOGL", "SNAP", "PINS"})
+        self.assertEqual(meta["peer_selection_mode"], "strict")
+
+    def test_lly_peer_selection_keeps_only_pharma_when_strict_set_is_sufficient(self) -> None:
+        selected, meta = self.service._select_peers_from_candidates(
+            {
+                "ticker": "LLY",
+                "sector": "Healthcare",
+                "industry": "Drug Manufacturers - General",
+                "sic": "2834",
+                "business_type": "PHARMA",
+                "revenue_bln_latest": 40.0,
+                "ebit_margin_pct": 32.0,
+            },
+            [
+                {"ticker": "PFE", "sector": "Healthcare", "industry": "Drug Manufacturers - General", "sic": "2834", "market_cap_bln": 180.0, "pe_ratio": 15.0, "pb_ratio": 2.1, "roe_pct": 18.0, "revenue_growth_pct": 3.0, "debt_to_equity": 0.5, "revenue_bln": 60.0, "ebit_margin_pct": 28.0},
+                {"ticker": "MRK", "sector": "Healthcare", "industry": "Drug Manufacturers - General", "sic": "2834", "market_cap_bln": 320.0, "pe_ratio": 18.0, "pb_ratio": 4.5, "roe_pct": 22.0, "revenue_growth_pct": 6.0, "debt_to_equity": 0.7, "revenue_bln": 62.0, "ebit_margin_pct": 31.0},
+                {"ticker": "ABBV", "sector": "Healthcare", "industry": "Drug Manufacturers - General", "sic": "2834", "market_cap_bln": 300.0, "pe_ratio": 17.0, "pb_ratio": 15.0, "roe_pct": 30.0, "revenue_growth_pct": 5.0, "debt_to_equity": 3.5, "revenue_bln": 55.0, "ebit_margin_pct": 30.0},
+                {"ticker": "UNH", "sector": "Healthcare", "industry": "Healthcare Plans", "sic": "6324", "market_cap_bln": 420.0, "pe_ratio": 19.0, "pb_ratio": 5.0, "roe_pct": 26.0, "revenue_growth_pct": 8.0, "debt_to_equity": 0.8, "revenue_bln": 370.0, "ebit_margin_pct": 8.0},
+                {"ticker": "HCA", "sector": "Healthcare", "industry": "Medical Care Facilities", "sic": "8062", "market_cap_bln": 95.0, "pe_ratio": 13.0, "pb_ratio": 20.0, "roe_pct": 60.0, "revenue_growth_pct": 7.0, "debt_to_equity": 12.0, "revenue_bln": 65.0, "ebit_margin_pct": 14.0},
+            ],
+            700.0,
+            ["PFE", "MRK", "ABBV", "UNH", "HCA"],
+        )
+
+        tickers = {row["ticker"] for row in selected}
+        self.assertTrue({"PFE", "MRK", "ABBV"}.issubset(tickers))
+        self.assertNotIn("UNH", tickers)
+        self.assertNotIn("HCA", tickers)
+        self.assertEqual(meta["peer_selection_mode"], "strict")
 
     def test_aapl_peers_are_not_empty_with_mega_cap_fallback(self) -> None:
         selected, meta = self.service._select_peers_from_candidates(
@@ -306,6 +695,7 @@ class ScoringSafetyTests(unittest.TestCase):
 
         self.assertNotEqual(selected, [])
         self.assertEqual(meta["peer_selection_mode"], "fallback")
+        self.assertGreaterEqual(meta["peer_count_total"], 3)
 
     def test_msft_peers_are_not_empty(self) -> None:
         selected, meta = self.service._select_peers_from_candidates(
@@ -361,6 +751,7 @@ class ScoringSafetyTests(unittest.TestCase):
                 {"ticker": "MSFT", "pe_ratio": None, "pb_ratio": None, "roe_pct": 30.0, "revenue_growth_pct": 12.0, "debt_to_equity": 0.2},
             ],
             {
+                "company_ticker": "MSFT",
                 "usable_peer_tickers": ["MSFT"],
             },
             {"current_price": 100.0},
@@ -368,8 +759,114 @@ class ScoringSafetyTests(unittest.TestCase):
         )
 
         self.assertEqual(peer_averages["valuation_baseline_mode"], "neutral")
-        self.assertEqual(peer_averages["pe_ratio"], 10.0)
-        self.assertEqual(peer_averages["pb_ratio"], 2.0)
+        self.assertIsNone(peer_averages["pe_ratio"])
+        self.assertIsNone(peer_averages["pb_ratio"])
+
+    def test_valuation_block_is_disabled_when_usable_peers_are_below_three(self) -> None:
+        metrics = self.service._build_silver_metrics(
+            {
+                "current_price": 100.0,
+                "one_year_return_pct": 5.0,
+                "five_year_return_pct": 15.0,
+            },
+            {
+                "revenue_bln": [100.0, 95.0, 90.0],
+                "net_income_bln": 10.0,
+                "equity_bln": 50.0,
+                "roic_pct": 18.0,
+                "ebit_margin_pct": 22.0,
+                "fcf_margin_pct": 12.0,
+                "debt_to_equity": 0.8,
+                "current_ratio": 1.5,
+                "shares_outstanding_mln": 1000.0,
+            },
+            {
+                "pe_ratio": 20.0,
+                "pb_ratio": 4.0,
+                "roe_pct": 15.0,
+                "revenue_growth_pct": 7.0,
+                "debt_to_equity": 0.9,
+                "pe_ratio_valid_count": 4,
+                "pb_ratio_valid_count": 4,
+                "peer_count_usable": 2,
+                "peer_confidence": "medium",
+                "peer_baseline_reliability": "medium",
+            },
+        )
+
+        self.assertFalse(metrics["valuation_enabled"])
+        self.assertIsNone(metrics["pe_premium_pct"])
+        self.assertIsNone(metrics["pb_premium_pct"])
+
+        weighted_scores = self.service._build_weighted_scores(
+            metrics,
+            {
+                "fed_funds_rate_pct": 4.0,
+                "inflation_pct": 3.0,
+                "unemployment_pct": 4.0,
+                "gdp_growth_pct": 2.0,
+            },
+        )
+
+        self.assertIsNone(weighted_scores["valuation"][0])
+        self.assertEqual(weighted_scores["valuation"][1], 0.0)
+
+    def test_peer_confidence_reduces_valuation_weight(self) -> None:
+        base_metrics = {
+            "roe_pct": 20.0,
+            "roe_score_pct": 20.0,
+            "roic_pct": 18.0,
+            "ebit_margin_pct": 20.0,
+            "debt_to_equity": 1.0,
+            "current_ratio": 1.5,
+            "fcf_margin_pct": 10.0,
+            "pe_premium_pct": 5.0,
+            "pb_premium_pct": 5.0,
+            "revenue_growth_pct": 10.0,
+            "revenue_cagr_like_pct": 9.0,
+            "one_year_return_pct": 5.0,
+            "five_year_return_pct": 15.0,
+            "is_bank_like": False,
+            "valuation_enabled": True,
+        }
+        macro = {
+            "fed_funds_rate_pct": 4.0,
+            "inflation_pct": 3.0,
+            "unemployment_pct": 4.0,
+            "gdp_growth_pct": 2.0,
+        }
+
+        high_weight = self.service._build_weighted_scores(
+            base_metrics | {"peer_confidence_multiplier": 1.0},
+            macro,
+        )["valuation"][1]
+        low_weight = self.service._build_weighted_scores(
+            base_metrics | {"peer_confidence_multiplier": 0.65},
+            macro,
+        )["valuation"][1]
+
+        self.assertLess(low_weight, high_weight)
+
+    def test_aapl_small_usable_peer_set_uses_thematic_baseline(self) -> None:
+        peer_averages = self.service._build_peer_averages(
+            [
+                {"ticker": "NVDA", "pe_ratio": 38.45, "pb_ratio": 20.0, "roe_pct": 65.0, "revenue_growth_pct": 61.4, "debt_to_equity": 0.3},
+                {"ticker": "MSFT", "pe_ratio": 32.0, "pb_ratio": 10.0, "roe_pct": 35.0, "revenue_growth_pct": 15.0, "debt_to_equity": 0.4},
+                {"ticker": "GOOGL", "pe_ratio": 26.0, "pb_ratio": 7.0, "roe_pct": 30.0, "revenue_growth_pct": 12.0, "debt_to_equity": 0.1},
+            ],
+            {
+                "company_ticker": "AAPL",
+                "usable_peer_tickers": ["NVDA"],
+            },
+            {"current_price": 200.0},
+            {"shares_outstanding_mln": 1500.0, "net_income_bln": 90.0, "equity_bln": 70.0},
+        )
+
+        self.assertEqual(peer_averages["valuation_baseline_mode"], "thematic")
+        self.assertTrue(peer_averages["peer_baseline_insufficient"])
+        self.assertEqual(peer_averages["peer_baseline_reliability"], "low")
+        self.assertLess(peer_averages["revenue_growth_pct"], 30.0)
+        self.assertNotEqual(peer_averages["pe_ratio"], 3.33)
 
     def test_small_sample_warnings_are_emitted(self) -> None:
         warnings = self.service._build_data_quality_warnings(
@@ -387,13 +884,14 @@ class ScoringSafetyTests(unittest.TestCase):
                 "peer_selection_source": "config",
                 "peer_group_quality_passed": True,
                 "peer_group_sample_limited": True,
+                "peer_baseline_insufficient": True,
                 "business_type_confidence": "medium",
             },
             False,
         )
 
-        self.assertIn("Peer comparison based on limited peer set", warnings)
-        self.assertIn("Peer averages computed from small sample size", warnings)
+        self.assertTrue(any("Peer low confidence:" in warning for warning in warnings))
+        self.assertIn("Usable peer set too small (<3); valuation was disabled", warnings)
 
     def test_expansion_and_partial_universe_warnings_are_emitted(self) -> None:
         warnings = self.service._build_data_quality_warnings(
@@ -411,6 +909,7 @@ class ScoringSafetyTests(unittest.TestCase):
                 "peer_selection_source": "business_type",
                 "peer_group_quality_passed": True,
                 "peer_group_sample_limited": True,
+                "peer_selection_mode": "extended",
                 "peer_expansion_level": 2,
                 "peer_count": 2,
                 "target_peer_count": 5,
@@ -420,9 +919,8 @@ class ScoringSafetyTests(unittest.TestCase):
             False,
         )
 
-        self.assertIn("Peer set expanded using lower-confidence candidates within same business type", warnings)
-        self.assertIn("Peer target count was not reached; comparison is based on partial peer universe", warnings)
-        self.assertIn("Some peers were excluded due to incompatible business models", warnings)
+        self.assertTrue(any("Peer low confidence:" in warning for warning in warnings))
+        self.assertIn("Peer cleanup applied: incompatible business models were excluded", warnings)
 
     def test_business_type_selection_keeps_reit_away_from_retail_and_industrials(self) -> None:
         selected, meta = self.service._select_peers_from_candidates(
@@ -444,7 +942,8 @@ class ScoringSafetyTests(unittest.TestCase):
         )
 
         self.assertEqual([row["ticker"] for row in selected[:2]], ["SPG", "PLD"])
-        self.assertTrue(meta["peer_group_quality_passed"])
+        self.assertFalse(meta["peer_group_quality_passed"])
+        self.assertLess(meta["peer_count_usable"], 3)
 
     def test_restaurants_do_not_take_retail_as_strict_peers(self) -> None:
         selected, meta = self.service._select_peers_from_candidates(
@@ -504,7 +1003,8 @@ class ScoringSafetyTests(unittest.TestCase):
             ["LOW", "WMT", "COST"],
         )
 
-        self.assertEqual([row["ticker"] for row in selected], ["LOW", "COST", "WMT"])
+        self.assertEqual([row["ticker"] for row in selected[:1]], ["LOW"])
+        self.assertEqual(set(row["ticker"] for row in selected[1:]), {"WMT", "COST"})
         self.assertFalse(meta["peer_group_quality_passed"])
 
     def test_api_first_peer_selection_prefers_primary_provider(self) -> None:
@@ -538,7 +1038,7 @@ class ScoringSafetyTests(unittest.TestCase):
             {"shares_outstanding_mln": 1500.0},
         )
 
-        self.assertEqual([item["ticker"] for item in peers], ["AMD", "NVDA", "QCOM"])
+        self.assertEqual({item["ticker"] for item in peers}, {"AMD", "NVDA", "QCOM"})
         self.assertEqual(meta["peer_selection_source"], "fmp")
 
     def test_api_peer_selection_falls_back_through_chain(self) -> None:
@@ -623,8 +1123,8 @@ class ScoringSafetyTests(unittest.TestCase):
 
         self.assertEqual([row["ticker"] for row in peers[:2]], ["LOW", "FLOOR"])
         self.assertEqual(meta["peer_count"], 3)
-        self.assertEqual(meta["peer_sample_mode"], "limited")
-        self.assertEqual(meta["peer_expansion_level"], 0)
+        self.assertEqual(meta["peer_sample_mode"], "full")
+        self.assertEqual(meta["peer_expansion_level"], 3)
 
     def test_fail_closed_when_broad_fallback_is_irrelevant(self) -> None:
         class _Provider:
@@ -679,6 +1179,7 @@ class ScoringSafetyTests(unittest.TestCase):
                 "pe_ratio_baseline_noisy": False,
                 "pb_ratio_baseline_noisy": False,
                 "peer_selection_confidence": "low",
+                "peer_selection_mode": "fallback",
                 "peer_selection_source": "config",
                 "peer_group_quality_passed": False,
                 "business_type_confidence": "low",
@@ -686,11 +1187,99 @@ class ScoringSafetyTests(unittest.TestCase):
             False,
         )
 
-        self.assertIn("Peer baseline used fallback source due to insufficient API peers", warnings)
-        self.assertIn("Peer selection used broad fallback because no reliable API peers were found", warnings)
-        self.assertIn("No reliable peers found within inferred business type", warnings)
-        self.assertIn("Comparative metrics were downgraded due to weak peer relevance", warnings)
-        self.assertIn("Broad fallback peers were rejected for scoring use", warnings)
+        self.assertTrue(any("Peer low confidence:" in warning for warning in warnings))
+
+    def test_jpm_bank_stability_does_not_fall_to_zero_from_generic_rules(self) -> None:
+        weighted_scores = self.service._build_weighted_scores(
+            {
+                "roe_pct": 16.0,
+                "roic_pct": None,
+                "ebit_margin_pct": None,
+                "debt_to_equity": None,
+                "current_ratio": None,
+                "fcf_margin_pct": None,
+                "pe_premium_pct": 10.0,
+                "pb_premium_pct": 5.0,
+                "revenue_growth_pct": 5.0,
+                "revenue_cagr_like_pct": 4.0,
+                "one_year_return_pct": 12.0,
+                "five_year_return_pct": 85.0,
+                "is_bank_like": True,
+                "peer_count_usable": 4,
+            },
+            {
+                "fed_funds_rate_pct": 4.0,
+                "inflation_pct": 3.0,
+                "unemployment_pct": 4.0,
+                "gdp_growth_pct": 2.0,
+            },
+        )
+
+        self.assertGreater(weighted_scores["stability"][0], 0.0)
+
+    def test_direct_peer_baseline_requires_at_least_three_usable_peers(self) -> None:
+        peer_averages = self.service._build_peer_averages(
+            [
+                {"ticker": "CRM", "pe_ratio": 26.0, "pb_ratio": 4.0, "roe_pct": 12.0, "revenue_growth_pct": 9.0, "debt_to_equity": 0.2},
+                {"ticker": "ADBE", "pe_ratio": 30.0, "pb_ratio": 12.0, "roe_pct": 35.0, "revenue_growth_pct": 11.0, "debt_to_equity": 0.3},
+            ],
+            {
+                "company_ticker": "MSFT",
+                "usable_peer_tickers": ["CRM", "ADBE"],
+            },
+            {"current_price": 100.0},
+            {"shares_outstanding_mln": 1000.0, "net_income_bln": 10.0, "equity_bln": 50.0},
+        )
+
+        self.assertNotEqual(peer_averages["valuation_baseline_mode"], "peer")
+        self.assertEqual(peer_averages["peer_baseline_reliability"], "low")
+        self.assertIsNone(peer_averages["pe_ratio"])
+
+    def test_extended_or_thematic_peers_are_used_when_strict_set_is_below_three(self) -> None:
+        selected, meta = self.service._select_peers_from_candidates(
+            {
+                "ticker": "MSFT",
+                "sector": "Technology",
+                "industry": "Software - Infrastructure",
+                "sic": "",
+                "business_type": "ENTERPRISE_SOFTWARE",
+            },
+            [
+                {"ticker": "ORCL", "sector": "Technology", "industry": "Software - Infrastructure", "sic": "", "market_cap_bln": 380.0, "pe_ratio": 28.0, "pb_ratio": 30.0, "roe_pct": None, "revenue_growth_pct": 8.0, "debt_to_equity": 5.0},
+                {"ticker": "ADBE", "sector": "Technology", "industry": "Software - Infrastructure", "sic": "", "market_cap_bln": 220.0, "pe_ratio": 30.0, "pb_ratio": 12.0, "roe_pct": 35.0, "revenue_growth_pct": 11.0, "debt_to_equity": 0.3},
+                {"ticker": "CRM", "sector": "Technology", "industry": "Software - Application", "sic": "", "market_cap_bln": 260.0, "pe_ratio": 26.0, "pb_ratio": 4.0, "roe_pct": 12.0, "revenue_growth_pct": 9.0, "debt_to_equity": 0.2},
+                {"ticker": "SAP", "sector": "Technology", "industry": "Software", "sic": "", "market_cap_bln": 220.0, "pe_ratio": 28.0, "pb_ratio": 5.0, "roe_pct": 16.0, "revenue_growth_pct": 7.0, "debt_to_equity": 0.3},
+            ],
+            3100.0,
+            ["ORCL", "ADBE", "CRM", "SAP"],
+        )
+
+        self.assertNotEqual(selected, [])
+        self.assertGreaterEqual(meta["peer_count_total"], 3)
+
+    def test_aapl_mega_cap_peers_reach_ranked_pool(self) -> None:
+        selected, meta = self.service._select_peers_from_candidates(
+            {
+                "ticker": "AAPL",
+                "sector": "Technology",
+                "industry": "Consumer Electronics",
+                "sic": "",
+                "business_type": "CONSUMER_HARDWARE_ECOSYSTEM",
+            },
+            [
+                {"ticker": "MSFT", "sector": "Technology", "industry": "Software - Infrastructure", "sic": "", "market_cap_bln": 3100.0, "pe_ratio": 34.0, "pb_ratio": 10.0, "roe_pct": 35.0, "revenue_growth_pct": 15.0, "debt_to_equity": 0.4},
+                {"ticker": "GOOGL", "sector": "Communication Services", "industry": "Internet Content & Information", "sic": "", "market_cap_bln": 2000.0, "pe_ratio": 26.0, "pb_ratio": 7.0, "roe_pct": 30.0, "revenue_growth_pct": 12.0, "debt_to_equity": 0.1},
+                {"ticker": "AMZN", "sector": "Consumer Cyclical", "industry": "Internet Retail", "sic": "", "market_cap_bln": 1900.0, "pe_ratio": 45.0, "pb_ratio": 8.0, "roe_pct": 24.0, "revenue_growth_pct": 11.0, "debt_to_equity": 0.6},
+                {"ticker": "META", "sector": "Communication Services", "industry": "Internet Content & Information", "sic": "", "market_cap_bln": 1500.0, "pe_ratio": 28.0, "pb_ratio": 9.0, "roe_pct": 33.0, "revenue_growth_pct": 18.0, "debt_to_equity": 0.2},
+                {"ticker": "NVDA", "sector": "Technology", "industry": "Semiconductors", "sic": "", "market_cap_bln": 2800.0, "pe_ratio": 40.0, "pb_ratio": 20.0, "roe_pct": 65.0, "revenue_growth_pct": 60.0, "debt_to_equity": 0.3},
+            ],
+            3200.0,
+            ["MSFT", "GOOGL", "AMZN", "META", "NVDA"],
+        )
+
+        self.assertGreaterEqual(meta["peer_count_total"], 4)
+        self.assertIn("MSFT", [row["ticker"] for row in selected])
+        self.assertIn("GOOGL", [row["ticker"] for row in selected])
 
     def test_relative_valuation_is_not_perfect_at_peer_parity(self) -> None:
         weighted_scores = self.service._build_weighted_scores(
@@ -817,7 +1406,8 @@ class ScoringSafetyTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(weighted_scores["stability"][1], 0.0)
+        self.assertGreater(weighted_scores["stability"][1], 0.0)
+        self.assertGreater(weighted_scores["stability"][0], 0.0)
         self.assertGreater(weighted_scores["growth"][0], 0.0)
 
         warnings = self.service._build_data_quality_warnings(
@@ -834,7 +1424,53 @@ class ScoringSafetyTests(unittest.TestCase):
             },
             True,
         )
-        self.assertIn("Bank-specific scoring rules were applied; some generic corporate metrics were excluded", warnings)
+        self.assertIn("Sector-specific fallback applied: bank-safe stability logic replaced generic debt/FCF rules", warnings)
+
+    def test_bank_stability_score_no_longer_depends_on_peer_count_placeholder(self) -> None:
+        base_metrics = {
+            "roe_pct": 18.0,
+            "roic_pct": None,
+            "ebit_margin_pct": None,
+            "debt_to_equity": 8.0,
+            "current_ratio": None,
+            "fcf_margin_pct": None,
+            "pe_premium_pct": 10.0,
+            "pb_premium_pct": 10.0,
+            "revenue_growth_pct": 5.0,
+            "revenue_cagr_like_pct": 4.0,
+            "one_year_return_pct": 3.0,
+            "five_year_return_pct": 10.0,
+            "is_bank_like": True,
+        }
+        macro = {
+            "fed_funds_rate_pct": 4.0,
+            "inflation_pct": 3.0,
+            "unemployment_pct": 4.0,
+            "gdp_growth_pct": 2.0,
+        }
+
+        low_peer_score = self.service._build_weighted_scores(base_metrics | {"peer_count_usable": 1}, macro)["stability"][0]
+        high_peer_score = self.service._build_weighted_scores(base_metrics | {"peer_count_usable": 5}, macro)["stability"][0]
+
+        self.assertEqual(low_peer_score, high_peer_score)
+
+    def test_peer_rows_keep_missing_market_cap_as_none(self) -> None:
+        rows = self.service._peer_rows(
+            [
+                {
+                    "ticker": "TEST",
+                    "company": "Test",
+                    "sector": "Technology",
+                    "industry": "Software",
+                    "market_cap_bln": None,
+                    "pe_ratio": None,
+                    "roe_pct": 12.0,
+                    "revenue_growth_pct": 5.0,
+                }
+            ]
+        )
+
+        self.assertIsNone(rows[0].market_cap_bln)
 
     def test_real_zero_stays_distinct_from_invalid(self) -> None:
         cards = self.service._metric_cards(

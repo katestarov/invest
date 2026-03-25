@@ -1,11 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api import routes
 from app.api.routes import router
 from app.core.database import Base, engine
+from app.core.logging_config import configure_logging
 from app.core.settings import get_settings
+from app.middleware.request_context import correlation_id_middleware
 
 settings = get_settings()
+configure_logging(settings.log_level)
 
 app = FastAPI(
     title="Investment Attractiveness API",
@@ -21,6 +25,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.middleware("http")(correlation_id_middleware)
+
 app.include_router(router, prefix="/api/v1")
 
 
@@ -31,6 +37,11 @@ def on_startup() -> None:
     except Exception:
         # Allow the API to start even if PostgreSQL is temporarily unavailable.
         pass
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    routes.service.close()
 
 
 @app.get("/")

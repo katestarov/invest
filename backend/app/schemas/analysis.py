@@ -16,7 +16,7 @@ class MetricCard(BaseModel):
 class ScoreBreakdownItem(BaseModel):
     key: str
     label: str
-    score: float = Field(ge=0, le=100)
+    score: float | None = Field(default=None, ge=0, le=100)
     weight: float = Field(ge=0, le=1)
     summary: str
 
@@ -27,7 +27,7 @@ class PeerRow(BaseModel):
     sector: str
     industry: str
     score: float = Field(ge=0, le=100)
-    market_cap_bln: float
+    market_cap_bln: float | None
     pe_ratio: float | None
     roe_pct: float | None
     revenue_growth_pct: float | None
@@ -36,7 +36,7 @@ class PeerRow(BaseModel):
 class FundamentalTrendPoint(BaseModel):
     period: str
     revenue_bln: float
-    free_cash_flow_bln: float
+    free_cash_flow_bln: float | None
 
 
 class PriceHistoryPoint(BaseModel):

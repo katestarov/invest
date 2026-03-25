@@ -1,8 +1,8 @@
 import { FormEvent, useEffect, useState } from "react";
 
-import { BreakdownBars } from "./components/BreakdownBars";
+import { BreakdownBarsSafe } from "./components/BreakdownBarsSafe";
 import { MacroPanel } from "./components/MacroPanel";
-import { MetricGrid } from "./components/MetricGrid";
+import { MetricGridSafe } from "./components/MetricGridSafe";
 import { PeerTable } from "./components/PeerTable";
 import { PriceChart } from "./components/PriceChart";
 import { ScoreRing } from "./components/ScoreRing";
@@ -97,10 +97,10 @@ export default function AppView() {
 
       {data && (
         <>
-          <MetricGrid items={data.metric_cards} />
+          <MetricGridSafe items={data.metric_cards} />
 
           <section className="dashboard-grid">
-            <BreakdownBars items={data.score_breakdown} />
+            <BreakdownBarsSafe items={data.score_breakdown} />
             <MacroPanel items={data.macro} />
           </section>
 

@@ -27,6 +27,17 @@ def round_or_none(value: Number, digits: int = 2) -> Number:
     return round(value, digits)
 
 
+def clamp_or_none(value: Number, lower: float | None = None, upper: float | None = None) -> Number:
+    if value is None:
+        return None
+    clamped = value
+    if lower is not None:
+        clamped = max(lower, clamped)
+    if upper is not None:
+        clamped = min(upper, clamped)
+    return clamped
+
+
 def premium_pct(value: Number, benchmark: Number) -> Number:
     ratio = safe_ratio(value, benchmark)
     if ratio is None:
@@ -99,6 +110,21 @@ def winsorized_mean(values: list[float], lower_quantile: float = 0.1, upper_quan
     return sum(clipped) / len(clipped)
 
 
+def trimmed_mean(values: list[float], trim_ratio: float = 0.1) -> Number:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) < 3:
+        return sum(ordered) / len(ordered)
+    trim_count = int(len(ordered) * trim_ratio)
+    if trim_count <= 0:
+        return sum(ordered) / len(ordered)
+    trimmed = ordered[trim_count : len(ordered) - trim_count]
+    if not trimmed:
+        trimmed = ordered
+    return sum(trimmed) / len(trimmed)
+
+
 def median_or_none(values: list[float]) -> Number:
     if not values:
         return None
@@ -114,7 +140,7 @@ def robust_baseline(
     if not values:
         return None, 0, True
 
-    baseline = median_or_none(values) if prefer_median else winsorized_mean(values)
+    baseline = median_or_none(values) if prefer_median else trimmed_mean(values)
     if baseline is None:
         return None, 0, True
 
@@ -185,6 +211,8 @@ def classify_company(
         "ABNB": "INTERNET_PLATFORM",
         "DASH": "INTERNET_PLATFORM",
         "LYFT": "INTERNET_PLATFORM",
+        "META": "INTERNET_PLATFORM",
+        "GOOGL": "INTERNET_PLATFORM",
         "V": "PAYMENTS",
         "MA": "PAYMENTS",
         "AXP": "PAYMENTS",
@@ -206,7 +234,7 @@ def classify_company(
         ("ENTERPRISE_SOFTWARE", ("enterprise software", "enterprise application", "crm", "erp", "workflow automation")),
         ("CONSUMER_HARDWARE_ECOSYSTEM", ("consumer electronics", "smartphone", "personal computer", "computer hardware", "hardware ecosystem")),
         ("SOFTWARE", ("software", "saas", "cloud", "enterprise application")),
-        ("INTERNET_PLATFORM", ("ride sharing", "ride-sharing", "marketplace", "travel platform", "hosting platform")),
+        ("INTERNET_PLATFORM", ("ride sharing", "ride-sharing", "marketplace", "travel platform", "hosting platform", "internet content", "social media", "digital advertising", "online advertising", "search engine")),
         ("E_COMMERCE", ("e-commerce", "ecommerce", "online retail", "online marketplace")),
         ("RESTAURANTS", ("restaurant", "coffee", "quick service", "fast food")),
         ("HOME_IMPROVEMENT_RETAIL", ("home improvement", "building materials", "home center")),
@@ -269,8 +297,10 @@ _COMPATIBILITY_RULES: dict[str, dict[str, tuple[str, ...]]] = {
 def business_type_compatibility(base_type: str | None, candidate_type: str | None) -> str:
     base = (base_type or "UNKNOWN").upper()
     candidate = (candidate_type or "UNKNOWN").upper()
-    if base in {"OTHER", "UNKNOWN"} or candidate in {"OTHER", "UNKNOWN"}:
-        return "WEAK" if base == candidate and base != "UNKNOWN" else "REJECT"
+    if base in {"OTHER", "UNKNOWN"}:
+        return "WEAK"
+    if candidate in {"OTHER", "UNKNOWN"}:
+        return "WEAK"
 
     rules = _COMPATIBILITY_RULES.get(base, {})
     for level in ("STRICT", "RELATED", "WEAK"):

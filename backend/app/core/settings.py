@@ -7,6 +7,7 @@ from functools import lru_cache
 class Settings:
     app_env: str
     app_port: int
+    log_level: str
     database_url: str
     fred_api_key: str | None
     fmp_api_key: str | None
@@ -25,6 +26,7 @@ def get_settings() -> Settings:
     return Settings(
         app_env=os.getenv("APP_ENV", "development"),
         app_port=int(os.getenv("APP_PORT", "8000")),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
         database_url=os.getenv("DATABASE_URL", "postgresql+psycopg://postgres:postgres@postgres:5432/invest"),
         fred_api_key=os.getenv("FRED_API_KEY"),
         fmp_api_key=os.getenv("FMP_API_KEY"),

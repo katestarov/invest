@@ -5,6 +5,9 @@ type Props = {
 };
 
 function buildPath(values: number[], width: number, height: number, padding: number) {
+  if (!values.length) {
+    return "";
+  }
   const max = Math.max(...values);
   const min = Math.min(...values);
   const range = max - min || 1;
@@ -18,6 +21,31 @@ function buildPath(values: number[], width: number, height: number, padding: num
     .join(" ");
 }
 
+function buildIndexedPath(
+  points: Array<{ index: number; value: number }>,
+  totalCount: number,
+  width: number,
+  height: number,
+  padding: number,
+) {
+  if (!points.length) {
+    return "";
+  }
+
+  const values = points.map((point) => point.value);
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const range = max - min || 1;
+
+  return points
+    .map((point, pointIndex) => {
+      const x = padding + (point.index * (width - padding * 2)) / Math.max(totalCount - 1, 1);
+      const y = height - padding - ((point.value - min) / range) * (height - padding * 2);
+      return `${pointIndex === 0 ? "M" : "L"} ${x} ${y}`;
+    })
+    .join(" ");
+}
+
 export function TrendChartRu({ points }: Props) {
   const width = 480;
   const height = 240;
@@ -26,7 +54,9 @@ export function TrendChartRu({ points }: Props) {
     left.period.localeCompare(right.period, undefined, { numeric: true }),
   );
   const revenue = sortedPoints.map((point) => point.revenue_bln);
-  const fcf = sortedPoints.map((point) => point.free_cash_flow_bln);
+  const fcf = sortedPoints
+    .map((point, index) => (point.free_cash_flow_bln === null ? null : { index, value: point.free_cash_flow_bln }))
+    .filter((point): point is { index: number; value: number } => point !== null);
 
   return (
     <div className="panel">
@@ -35,8 +65,8 @@ export function TrendChartRu({ points }: Props) {
         <span>Выручка и свободный денежный поток</span>
       </div>
       <svg viewBox={`0 0 ${width} ${height}`} className="trend-chart">
-        <path d={buildPath(revenue, width, height, padding)} className="trend-line revenue" />
-        <path d={buildPath(fcf, width, height, padding)} className="trend-line fcf" />
+        {revenue.length > 0 && <path d={buildPath(revenue, width, height, padding)} className="trend-line revenue" />}
+        {fcf.length > 0 && <path d={buildIndexedPath(fcf, sortedPoints.length, width, height, padding)} className="trend-line fcf" />}
         {sortedPoints.map((point, index) => (
           <text
             key={point.period}

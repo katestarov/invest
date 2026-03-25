@@ -13,7 +13,7 @@ export type MetricCard = {
 export type ScoreBreakdownItem = {
   key: string;
   label: string;
-  score: number;
+  score: number | null;
   weight: number;
   summary: string;
 };
@@ -24,7 +24,7 @@ export type PeerRow = {
   sector: string;
   industry: string;
   score: number;
-  market_cap_bln: number;
+  market_cap_bln: number | null;
   pe_ratio: number | null;
   roe_pct: number | null;
   revenue_growth_pct: number | null;
@@ -33,7 +33,7 @@ export type PeerRow = {
 export type FundamentalTrendPoint = {
   period: string;
   revenue_bln: number;
-  free_cash_flow_bln: number;
+  free_cash_flow_bln: number | null;
 };
 
 export type PriceHistoryPoint = {

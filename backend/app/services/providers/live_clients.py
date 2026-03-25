@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 import httpx
 
 from app.core.settings import get_settings
 from app.services.analysis_safety import robust_baseline, round_or_none, safe_ratio
 from app.utils.cache import TTLCache
 
+logger = logging.getLogger(__name__)
 
-def _safe_number(value: object, default: float = 0.0) -> float:
+def _safe_number(value: object, default: float | None = None) -> float | None:
     if value is None:
         return default
     if isinstance(value, (int, float)):
@@ -27,9 +29,9 @@ def _safe_number(value: object, default: float = 0.0) -> float:
         return default
 
 
-def _series_latest(entries: list[dict]) -> float:
+def _series_latest(entries: list[dict]) -> float | None:
     if not entries:
-        return 0.0
+        return None
     ordered = sorted(entries, key=lambda item: item.get("fy") or item.get("end") or "")
     return _safe_number(ordered[-1].get("val"))
 
@@ -79,12 +81,64 @@ def _series_annual(entries: list[dict], limit: int = 4) -> list[dict]:
     return ordered[:limit]
 
 
+def _series_instant(entries: list[dict], limit: int = 4) -> list[dict]:
+    instant_forms = {"10-K", "20-F", "10-K/A", "20-F/A", "40-F", "40-F/A"}
+    instant = [item for item in entries if str(item.get("form") or "").upper() in instant_forms]
+    deduped: dict[str, dict] = {}
+    for item in instant:
+        dedupe_key = str(item.get("end") or "")
+        current = deduped.get(dedupe_key)
+        if current is None:
+            deduped[dedupe_key] = item
+            continue
+        current_filed = _parse_date(current.get("filed"))
+        item_filed = _parse_date(item.get("filed"))
+        if item_filed and (current_filed is None or item_filed > current_filed):
+            deduped[dedupe_key] = item
+    ordered = sorted(
+        deduped.values(),
+        key=lambda item: (_parse_date(item.get("end")) or datetime.min, _parse_date(item.get("filed")) or datetime.min),
+        reverse=True,
+    )
+    return ordered[:limit]
+
+
 def _first_series(facts: dict, taxonomy: str, concepts: list[str], unit: str = "USD") -> list[dict]:
     for concept in concepts:
         series = facts.get("facts", {}).get(taxonomy, {}).get(concept, {}).get("units", {}).get(unit, [])
         if series:
             return series
     return []
+
+
+def _period_key(item: dict) -> str | None:
+    end = str(item.get("end") or "").strip()
+    if end:
+        return end[:10]
+    fy = str(item.get("fy") or "").strip()
+    fp = str(item.get("fp") or "").strip()
+    if fy or fp:
+        return f"{fy}|{fp}"
+    return None
+
+
+def _annual_value_points(entries: list[dict], *, scale: float = 1.0, absolute: bool = False) -> list[dict[str, object]]:
+    points: list[dict[str, object]] = []
+    for item in entries:
+        key = _period_key(item)
+        numeric_value = _safe_number(item.get("val"))
+        if key is None or numeric_value is None:
+            continue
+        value = abs(numeric_value) if absolute else numeric_value
+        points.append({"key": key, "item": item, "value": value / scale})
+    return points
+
+
+def _sum_present(*values: float | None) -> float | None:
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    return sum(present)
 
 
 def _map_sector(sic_description: str) -> str:
@@ -119,6 +173,15 @@ class BaseHttpProvider:
             "User-Agent": settings.sec_user_agent,
             "Accept": "application/json,text/plain,*/*",
         }
+        self.client = httpx.Client(
+            timeout=self.timeout,
+            follow_redirects=True,
+            headers=self.headers,
+            verify=True,
+        )
+
+    def close(self) -> None:
+        self.client.close()
 
     def _get_json(self, url: str, params: dict | None = None, headers: dict | None = None) -> dict | list:
         cache_key = f"{url}|{params}"
@@ -127,16 +190,12 @@ class BaseHttpProvider:
             return cached
 
         last_error: Exception | None = None
-        for _ in range(2):
+        for attempt in range(2):
             try:
-                use_verify = False if "sec.gov" in url else True
-                response = httpx.get(
+                response = self.client.get(
                     url,
                     params=params,
-                    headers=headers or self.headers,
-                    timeout=self.timeout,
-                    follow_redirects=True,
-                    verify=use_verify,
+                    headers=headers,
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -144,6 +203,10 @@ class BaseHttpProvider:
                 return payload
             except Exception as exc:
                 last_error = exc
+                logger.warning(
+                    "http_provider_request_failed",
+                    extra={"url": url, "attempt": attempt + 1, "error_type": type(exc).__name__},
+                )
         if last_error:
             raise last_error
         raise RuntimeError("HTTP request failed without a captured error.")
@@ -162,14 +225,17 @@ class YahooFinanceProvider(BaseHttpProvider):
         meta = chart_result.get("meta", {})
         timestamps = chart_result.get("timestamp", [])
         closes = chart_result["indicators"]["quote"][0].get("close", [])
-        price_history = [
-            {
-                "date": datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"),
-                "close": round(_safe_number(close), 2),
-            }
-            for ts, close in zip(timestamps, closes)
-            if close is not None
-        ]
+        price_history: list[dict[str, object]] = []
+        for ts, close in zip(timestamps, closes):
+            parsed_close = _safe_number(close)
+            if parsed_close is None:
+                continue
+            price_history.append(
+                {
+                    "date": datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"),
+                    "close": round(parsed_close, 2),
+                }
+            )
         closes_only = [point["close"] for point in price_history if point["close"] > 0]
         one_year_window = closes_only[-12:] if len(closes_only) >= 12 else closes_only
         five_year_return = 0.0
@@ -182,7 +248,7 @@ class YahooFinanceProvider(BaseHttpProvider):
         payload = {
             "company": meta.get("longName") or meta.get("shortName") or ticker,
             "currency": meta.get("currency", "USD"),
-            "current_price": _safe_number(meta.get("regularMarketPrice") or meta.get("previousClose")),
+            "current_price": round_or_none(_safe_number(meta.get("regularMarketPrice") or meta.get("previousClose")), 2),
             "one_year_return_pct": round(one_year_return, 2),
             "five_year_return_pct": round(five_year_return, 2),
             "price_history": price_history[-24:],
@@ -239,7 +305,7 @@ class SecEdgarProvider(BaseHttpProvider):
                 ],
             )
         )
-        equity_series = _series_annual(
+        equity_series = _series_instant(
             _first_series(
                 facts,
                 "us-gaap",
@@ -250,9 +316,9 @@ class SecEdgarProvider(BaseHttpProvider):
                 ],
             )
         )
-        current_assets_series = _series_annual(_first_series(facts, "us-gaap", ["AssetsCurrent"]))
-        current_liabilities_series = _series_annual(_first_series(facts, "us-gaap", ["LiabilitiesCurrent"]))
-        liabilities_series = _series_annual(
+        current_assets_series = _series_instant(_first_series(facts, "us-gaap", ["AssetsCurrent"]))
+        current_liabilities_series = _series_instant(_first_series(facts, "us-gaap", ["LiabilitiesCurrent"]))
+        liabilities_series = _series_instant(
             _first_series(
                 facts,
                 "us-gaap",
@@ -262,7 +328,7 @@ class SecEdgarProvider(BaseHttpProvider):
                 ],
             )
         )
-        debt_series = _series_annual(
+        debt_series = _series_instant(
             _first_series(
                 facts,
                 "us-gaap",
@@ -273,7 +339,7 @@ class SecEdgarProvider(BaseHttpProvider):
                 ],
             )
         )
-        current_debt_series = _series_annual(
+        current_debt_series = _series_instant(
             _first_series(
                 facts,
                 "us-gaap",
@@ -285,8 +351,20 @@ class SecEdgarProvider(BaseHttpProvider):
                 ],
             )
         )
-        assets_series = _series_annual(_first_series(facts, "us-gaap", ["Assets"]))
+        cash_series = _series_instant(
+            _first_series(
+                facts,
+                "us-gaap",
+                [
+                    "CashAndCashEquivalentsAtCarryingValue",
+                    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                ],
+            )
+        )
+        assets_series = _series_instant(_first_series(facts, "us-gaap", ["Assets"]))
         operating_income_series = _series_annual(_first_series(facts, "us-gaap", ["OperatingIncomeLoss"]))
+        pretax_income_series = _series_annual(_first_series(facts, "us-gaap", ["IncomeBeforeTaxExpenseBenefit"]))
+        tax_expense_series = _series_annual(_first_series(facts, "us-gaap", ["IncomeTaxExpenseBenefit"]))
         net_income_series = _series_annual(
             _first_series(
                 facts,
@@ -298,45 +376,71 @@ class SecEdgarProvider(BaseHttpProvider):
                 ],
             )
         )
-        shares_series = _series_annual(
+        shares_series = _series_instant(
             facts.get("facts", {}).get("dei", {}).get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
         )
 
-        revenues = [_safe_number(item.get("val")) / 1_000_000_000 for item in revenue_series]
-        cfo = [_safe_number(item.get("val")) / 1_000_000_000 for item in cfo_series]
-        capex = [abs(_safe_number(item.get("val"))) / 1_000_000_000 for item in capex_series]
-        fcf = [round(cfo_item - capex_item, 2) for cfo_item, capex_item in zip(cfo, capex)]
+        revenue_points = _annual_value_points(revenue_series, scale=1_000_000_000)
+        cfo_points = _annual_value_points(cfo_series, scale=1_000_000_000)
+        capex_points = _annual_value_points(capex_series, scale=1_000_000_000, absolute=True)
+        revenues = [round_or_none(point["value"], 2) for point in revenue_points]
+        cfo_by_key = {str(point["key"]): float(point["value"]) for point in cfo_points}
+        capex_by_key = {str(point["key"]): float(point["value"]) for point in capex_points}
+        fcf_by_key = {
+            key: round(cfo_by_key[key] - capex_by_key[key], 2)
+            for key in cfo_by_key.keys() & capex_by_key.keys()
+        }
         latest_equity = _series_latest(equity_series)
         latest_assets = _series_latest(assets_series)
         latest_liabilities = _series_latest(liabilities_series)
         latest_debt = _series_latest(debt_series)
         latest_current_debt = _series_latest(current_debt_series)
+        latest_cash = _series_latest(cash_series)
         latest_current_assets = _series_latest(current_assets_series)
         latest_current_liabilities = _series_latest(current_liabilities_series)
         latest_operating_income = _series_latest(operating_income_series)
+        latest_pretax_income = _series_latest(pretax_income_series)
+        latest_tax_expense = _series_latest(tax_expense_series)
         latest_net_income = _series_latest(net_income_series)
         latest_shares_outstanding = _series_latest(shares_series)
         sic_description = submissions.get("sicDescription") or ""
 
-        latest_revenue = revenues[0] if revenues else 0.0
-        latest_fcf = fcf[0] if fcf else 0.0
+        history = [
+            {
+                "period": str(point["item"].get("fy") or str(point["item"].get("end", ""))[:4]),
+                "revenue_bln": round(float(point["value"]), 2),
+                "free_cash_flow_bln": round_or_none(fcf_by_key.get(str(point["key"])), 2),
+            }
+            for point in revenue_points
+        ]
+        latest_revenue = history[0]["revenue_bln"] if history else None
+        latest_fcf = history[0]["free_cash_flow_bln"] if history else None
         current_ratio = safe_ratio(latest_current_assets, latest_current_liabilities)
-        total_debt = latest_debt + latest_current_debt
-        fallback_debt = max(latest_liabilities - latest_equity, 0)
-        debt_base = total_debt if total_debt > 0 else fallback_debt
+        total_debt = _sum_present(latest_debt, latest_current_debt)
+        fallback_debt = max(latest_liabilities - latest_equity, 0) if latest_liabilities is not None and latest_equity is not None else None
+        debt_base = total_debt if total_debt is not None and total_debt > 0 else fallback_debt
         debt_to_equity = safe_ratio(debt_base, latest_equity)
-        roic_pct = safe_ratio(latest_operating_income, latest_equity)
-        ebit_margin_pct = safe_ratio(latest_operating_income, latest_revenue * 1_000_000_000 if latest_revenue else None)
+        effective_tax_rate = safe_ratio(latest_tax_expense, latest_pretax_income)
+        estimated_tax_rate = effective_tax_rate is None and latest_operating_income is not None
+        tax_rate = min(max(effective_tax_rate, 0.0), 0.35) if effective_tax_rate is not None else (0.21 if estimated_tax_rate else None)
+        nopat = latest_operating_income * (1 - tax_rate) if latest_operating_income is not None and tax_rate is not None else None
+        invested_capital = None
+        if latest_equity is not None:
+            invested_capital = (total_debt or 0.0) + latest_equity - (latest_cash or 0.0)
+            if invested_capital <= 0:
+                invested_capital = None
+        roic_pct = safe_ratio(nopat, invested_capital)
+        ebit_margin_pct = safe_ratio(latest_operating_income, latest_revenue * 1_000_000_000 if latest_revenue is not None else None)
         fcf_margin_pct = safe_ratio(latest_fcf, latest_revenue)
         revenue_periods = [
             {
-                "fy": str(item.get("fy") or ""),
-                "end": str(item.get("end") or ""),
+                "fy": str(point["item"].get("fy") or ""),
+                "end": str(point["item"].get("end") or ""),
                 "period_type": "annual",
-                "fiscal_period": str(item.get("fp") or ""),
-                "form": str(item.get("form") or ""),
+                "fiscal_period": str(point["item"].get("fp") or ""),
+                "form": str(point["item"].get("form") or ""),
             }
-            for item in revenue_series
+            for point in revenue_points
         ]
 
         payload = {
@@ -346,35 +450,33 @@ class SecEdgarProvider(BaseHttpProvider):
             "industry": sic_description or "Unknown",
             "sector": _map_sector(sic_description),
             "revenue_bln": revenues,
-            "free_cash_flow_bln": fcf,
+            "free_cash_flow_bln": [item["free_cash_flow_bln"] for item in history],
             "current_ratio": round_or_none(current_ratio, 2),
             "debt_to_equity": round_or_none(debt_to_equity, 2),
             "roic_pct": round_or_none(roic_pct * 100 if roic_pct is not None else None, 2),
             "ebit_margin_pct": round_or_none(ebit_margin_pct * 100 if ebit_margin_pct is not None else None, 2),
             "fcf_margin_pct": round_or_none(fcf_margin_pct * 100 if fcf_margin_pct is not None else None, 2),
-            "net_income_bln": round(latest_net_income / 1_000_000_000, 2),
-            "shares_outstanding_mln": round(latest_shares_outstanding / 1_000_000, 2),
-            "history": [
-                {
-                    "period": str(item.get("fy") or item.get("end", "")[:4]),
-                    "revenue_bln": revenue,
-                    "free_cash_flow_bln": free_cash_flow,
-                }
-                for item, revenue, free_cash_flow in zip(revenue_series, revenues, fcf)
-            ],
-            "assets_bln": round(latest_assets / 1_000_000_000, 2),
-            "equity_bln": round(latest_equity / 1_000_000_000, 2),
+            "net_income_bln": round_or_none(latest_net_income / 1_000_000_000 if latest_net_income is not None else None, 2),
+            "shares_outstanding_mln": round_or_none(latest_shares_outstanding / 1_000_000 if latest_shares_outstanding is not None else None, 2),
+            "history": history,
+            "assets_bln": round_or_none(latest_assets / 1_000_000_000 if latest_assets is not None else None, 2),
+            "equity_bln": round_or_none(latest_equity / 1_000_000_000 if latest_equity is not None else None, 2),
             "revenue_periods": revenue_periods,
         }
         warnings: list[str] = []
         if not revenues:
             warnings.append("SEC EDGAR не вернул годовую выручку в ожидаемом формате.")
-        if not fcf:
+        if latest_fcf is None:
+            warnings.append("FCF periods could not be aligned for the latest annual period.")
             warnings.append("SEC EDGAR не вернул достаточно данных для расчёта свободного денежного потока.")
-        if not latest_shares_outstanding:
+        if latest_shares_outstanding is None:
             warnings.append("SEC EDGAR не вернул число акций в обращении, часть рыночных коэффициентов будет приближённой.")
-        if latest_equity <= 0:
+        if latest_equity is not None and latest_equity <= 0:
             warnings.append("Negative equity detected: ROE, Debt/Equity and P/B may be unreliable")
+        if estimated_tax_rate:
+            warnings.append("ROIC uses an estimated tax rate because tax facts were incomplete.")
+        if latest_operating_income is not None and roic_pct is None:
+            warnings.append("ROIC is unavailable because invested capital inputs were incomplete or non-interpretable.")
         return ProviderResult(payload=payload, warnings=warnings)
 
 
@@ -422,7 +524,10 @@ class FredProvider(BaseHttpProvider):
         cpi_values = [item for item in cpi_prev_year.get("observations", []) if item.get("value") not in {".", None}]
         inflation = None
         if len(cpi_values) >= 13:
-            inflation = ((_safe_number(cpi_values[0]["value"]) / _safe_number(cpi_values[12]["value"])) - 1) * 100
+            current_cpi = _safe_number(cpi_values[0]["value"])
+            prior_cpi = _safe_number(cpi_values[12]["value"])
+            inflation_ratio = safe_ratio(current_cpi, prior_cpi)
+            inflation = ((inflation_ratio - 1) * 100) if inflation_ratio is not None else None
 
         return ProviderResult(
             payload={

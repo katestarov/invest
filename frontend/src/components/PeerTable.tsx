@@ -35,7 +35,7 @@ export function PeerTable({ rows, selectedTicker }: Props) {
                 <td>{row.ticker}</td>
                 <td>{row.company}</td>
                 <td>{row.score}</td>
-                <td>${row.market_cap_bln}B</td>
+                <td>{displayValue(row.market_cap_bln, "B") === "N/A" ? "N/A" : `$${displayValue(row.market_cap_bln, "B")}`}</td>
                 <td>{displayValue(row.pe_ratio)}</td>
                 <td>{displayValue(row.roe_pct, "%")}</td>
                 <td>{displayValue(row.revenue_growth_pct, "%")}</td>

@@ -100,14 +100,18 @@ class ConfigPeerProvider(PeerProvider):
     def discover(self, ticker: str, company_profile: dict) -> PeerDiscoveryResult:
         sector = company_profile.get("sector", "")
         industry = company_profile.get("industry", "")
-        matched_rule = None
+        strict_match = None
+        sector_only_match = None
         for rule in self.peer_group_config["rules"]:
             sector_match = rule["sector"] == sector
             industry_match = any(fragment.lower() in industry.lower() for fragment in rule["industry_contains"])
-            if sector_match or industry_match:
-                matched_rule = rule
+            if sector_match and industry_match:
+                strict_match = rule
                 break
+            if sector_match and sector_only_match is None:
+                sector_only_match = rule
 
+        matched_rule = strict_match or sector_only_match
         selected = matched_rule["tickers"] if matched_rule else self.peer_group_config["fallback"]["tickers"]
         reason = (
             "selected from local config fallback due to insufficient API peers"
