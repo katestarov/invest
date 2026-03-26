@@ -33,6 +33,8 @@ class PeerRow(BaseModel):
     roe_pct: float | None
     revenue_growth_pct: float | None
     quality_class: str = "usable"
+    included_in_baseline: bool = False
+    baseline_weight: float | None = None
     quality_note: str | None = None
 
 

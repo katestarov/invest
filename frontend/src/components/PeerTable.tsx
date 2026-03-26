@@ -9,20 +9,28 @@ function displayValue(value: number | null, suffix = "") {
   return value === null ? "N/A" : `${value}${suffix}`;
 }
 
-function qualityLabel(row: PeerRow) {
+function statusLabels(row: PeerRow) {
+  const labels: string[] = [];
   if (row.quality_note) {
-    return row.quality_note;
-  }
-  if (row.quality_class === "weak") {
-    return "Limited data";
-  }
-  if (row.quality_class === "excluded") {
-    return "Excluded from baseline";
+    labels.push(row.quality_note);
+  } else if (row.quality_class === "weak") {
+    labels.push("Limited data");
+  } else if (row.quality_class === "excluded") {
+    labels.push("Excluded from baseline");
   }
   if (row.market_cap_status === "suspect") {
-    return "Suspect market cap";
+    labels.push("Suspect market cap");
   }
-  return null;
+  if (row.included_in_baseline) {
+    if ((row.baseline_weight ?? 0) < 0.999) {
+      labels.push(`Included with reduced weight (${displayValue(row.baseline_weight ?? null)})`);
+    } else {
+      labels.push("Included in baseline");
+    }
+  } else if (row.quality_class !== "excluded") {
+    labels.push("Not used in current baseline");
+  }
+  return [...new Set(labels)];
 }
 
 export function PeerTable({ rows, selectedTicker }: Props) {
@@ -51,7 +59,7 @@ export function PeerTable({ rows, selectedTicker }: Props) {
                 <td>{row.ticker}</td>
                 <td>
                   <div>{row.company}</div>
-                  {qualityLabel(row) ? <small>{qualityLabel(row)}</small> : null}
+                  {statusLabels(row).length > 0 ? <small>{statusLabels(row).join(" • ")}</small> : null}
                 </td>
                 <td>{row.score}</td>
                 <td>{displayValue(row.market_cap_bln, "B") === "N/A" ? "N/A" : `$${displayValue(row.market_cap_bln, "B")}`}</td>

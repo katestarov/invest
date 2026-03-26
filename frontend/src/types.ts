@@ -30,6 +30,8 @@ export type PeerRow = {
   roe_pct: number | null;
   revenue_growth_pct: number | null;
   quality_class: "usable" | "weak" | "excluded";
+  included_in_baseline: boolean;
+  baseline_weight?: number | null;
   quality_note?: string | null;
 };
 
