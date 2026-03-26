@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.core.settings import get_settings
+from app.services.analysis_safety import round_or_none
 from app.services.analysis_safety import get_business_type_universe
-from app.services.providers.live_clients import BaseHttpProvider
+from app.services.providers.live_clients import BaseHttpProvider, _safe_number
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,23 @@ class FmpPeerProvider(BaseHttpProvider, PeerProvider):
             reason="selected via FMP peers API and filtered by industry/market-cap similarity",
         )
 
+    def fetch_market_cap_snapshot(self, ticker: str) -> tuple[float | None, str | None] | None:
+        if not self.api_key:
+            return None
+        payload = self._get_json(
+            "https://financialmodelingprep.com/stable/profile",
+            params={"symbol": ticker, "apikey": self.api_key},
+        )
+        values = payload if isinstance(payload, list) else [payload] if isinstance(payload, dict) else []
+        item = next((entry for entry in values if isinstance(entry, dict)), None)
+        if not item:
+            return None
+        market_cap_raw = _safe_number(item.get("marketCap") or item.get("mktCap") or item.get("marketcap"))
+        if market_cap_raw is None or market_cap_raw <= 0:
+            return None
+        currency = str(item.get("currency") or item.get("reportedCurrency") or item.get("defaultCurrency") or "").upper() or None
+        return round_or_none(market_cap_raw / 1_000_000_000, 2), currency
+
     def _extract_tickers(self, payload: dict | list) -> list[str]:
         if isinstance(payload, list):
             values = payload
@@ -89,6 +107,21 @@ class FinnhubPeerProvider(BaseHttpProvider, PeerProvider):
             source=self.source_name,
             reason="selected via Finnhub fallback and local filtering",
         )
+
+    def fetch_market_cap_snapshot(self, ticker: str) -> tuple[float | None, str | None] | None:
+        if not self.api_key:
+            return None
+        payload = self._get_json(
+            "https://finnhub.io/api/v1/stock/profile2",
+            params={"symbol": ticker, "token": self.api_key},
+        )
+        if not isinstance(payload, dict):
+            return None
+        market_cap_raw = _safe_number(payload.get("marketCapitalization"))
+        if market_cap_raw is None or market_cap_raw <= 0:
+            return None
+        currency = str(payload.get("currency") or "").upper() or None
+        return round_or_none(market_cap_raw / 1_000, 2), currency
 
 
 class ConfigPeerProvider(PeerProvider):

@@ -42,7 +42,7 @@ from app.middleware.request_context import correlation_id_middleware
 from app.schemas.analysis import AnalysisResponse
 from app.services.analysis_runtime_service import AnalysisService
 from app.services.analysis_safety import business_type_compatibility, classify_company, is_bank_like_company, normalize_weights, safe_ratio
-from app.services.providers.live_clients import BaseHttpProvider, SecEdgarProvider, _safe_number, _series_latest, summarize_peer_averages
+from app.services.providers.live_clients import BaseHttpProvider, FredProvider, SecEdgarProvider, _safe_number, _series_latest, summarize_peer_averages
 from app.services.providers.peer_providers import ConfigPeerProvider, PeerCandidate, PeerDiscoveryResult
 
 
@@ -90,6 +90,44 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertIsNone(_safe_number(None))
         self.assertIsNone(_safe_number("not-a-number"))
         self.assertIsNone(_series_latest([]))
+
+    def test_fred_inflation_uses_year_over_year_change(self) -> None:
+        provider = FredProvider.__new__(FredProvider)
+        provider.api_key = "test"
+
+        def fake_get_json(url: str, params: dict | None = None, headers: dict | None = None):
+            series_id = (params or {}).get("series_id")
+            if series_id == "CPIAUCSL":
+                return {
+                    "observations": [
+                        {"date": "2025-02-01", "value": "315.0"},
+                        {"date": "2025-01-01", "value": "314.0"},
+                        {"date": "2024-12-01", "value": "313.5"},
+                        {"date": "2024-11-01", "value": "312.8"},
+                        {"date": "2024-10-01", "value": "311.7"},
+                        {"date": "2024-09-01", "value": "310.9"},
+                        {"date": "2024-08-01", "value": "309.9"},
+                        {"date": "2024-07-01", "value": "309.1"},
+                        {"date": "2024-06-01", "value": "308.2"},
+                        {"date": "2024-05-01", "value": "307.1"},
+                        {"date": "2024-04-01", "value": "306.4"},
+                        {"date": "2024-03-01", "value": "305.6"},
+                        {"date": "2024-02-01", "value": "305.0"},
+                    ]
+                }
+            if series_id == "FEDFUNDS":
+                return {"observations": [{"date": "2025-02-01", "value": "4.33"}]}
+            if series_id == "UNRATE":
+                return {"observations": [{"date": "2025-02-01", "value": "4.0"}]}
+            return {"observations": []}
+
+        provider._get_json = fake_get_json
+
+        payload = provider.fetch_macro_bundle().payload
+
+        self.assertEqual(payload["fed_funds_rate_pct"], 4.33)
+        self.assertEqual(payload["unemployment_pct"], 4.0)
+        self.assertAlmostEqual(payload["inflation_pct"], 3.28, places=2)
 
     def test_http_provider_does_not_disable_ssl_verification(self) -> None:
         captured: dict[str, object] = {}
@@ -468,6 +506,31 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertFalse(diagnostics["suspect"])
         self.assertEqual(diagnostics["status"], "invalid")
         self.assertIn("USD conversion path", diagnostics["warning"])
+
+    def test_market_cap_prefers_consensus_cluster_when_external_sources_disagree_with_adr_like_quote(self) -> None:
+        diagnostics = self.service._market_cap_diagnostics(
+            {
+                "ticker": "TM",
+                "current_price": 250.0,
+                "currency": "USD",
+                "market_cap_bln_quote": 2771.07,
+                "market_cap_quote_currency": "USD",
+                "shares_outstanding_quote_mln": 16000.0,
+            },
+            {
+                "shares_outstanding_mln": 16000.0,
+            },
+            supplemental_market_caps=[
+                ("fmp_market_cap", 352.0, "USD"),
+                ("finnhub_market_cap", 347.0, "USD"),
+            ],
+        )
+
+        self.assertAlmostEqual(diagnostics["market_cap_bln"], 349.5, places=1)
+        self.assertEqual(diagnostics["source"], "median_of_sources")
+        self.assertTrue(diagnostics["suspect"])
+        self.assertEqual(diagnostics["status"], "suspect")
+        self.assertIn("disagree materially", diagnostics["warning"])
 
     def test_missing_fred_does_not_turn_into_zero_macro_bonus(self) -> None:
         weighted_scores = self.service._build_weighted_scores(
@@ -870,6 +933,86 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertIsNone(weighted_scores["valuation"][0])
         self.assertEqual(weighted_scores["valuation"][1], 0.0)
 
+    def test_valuation_stays_enabled_with_two_usable_and_one_weak_peer(self) -> None:
+        metrics = self.service._build_silver_metrics(
+            {
+                "current_price": 100.0,
+                "one_year_return_pct": 5.0,
+                "five_year_return_pct": 15.0,
+            },
+            {
+                "revenue_bln": [100.0, 95.0, 90.0],
+                "net_income_bln": 10.0,
+                "equity_bln": 50.0,
+                "roic_pct": 18.0,
+                "ebit_margin_pct": 22.0,
+                "fcf_margin_pct": 12.0,
+                "debt_to_equity": 0.8,
+                "current_ratio": 1.5,
+                "shares_outstanding_mln": 1000.0,
+            },
+            {
+                "pe_ratio": 20.0,
+                "pb_ratio": 4.0,
+                "roe_pct": 15.0,
+                "revenue_growth_pct": 7.0,
+                "debt_to_equity": 0.9,
+                "pe_ratio_valid_count": 3,
+                "pb_ratio_valid_count": 3,
+                "peer_count_usable": 2,
+                "peer_count_weak": 1,
+                "peer_count_supported": 3,
+                "valuation_support_mode": "low_confidence",
+                "peer_confidence": "medium",
+                "peer_baseline_reliability": "low",
+            },
+        )
+
+        self.assertTrue(metrics["valuation_enabled"])
+        self.assertTrue(metrics["valuation_low_confidence"])
+        self.assertFalse(metrics["valuation_fallback"])
+        self.assertIsNotNone(metrics["pe_premium_pct"])
+        self.assertIsNotNone(metrics["pb_premium_pct"])
+
+    def test_valuation_fallback_uses_one_usable_and_two_weak_peers(self) -> None:
+        metrics = self.service._build_silver_metrics(
+            {
+                "current_price": 100.0,
+                "one_year_return_pct": 5.0,
+                "five_year_return_pct": 15.0,
+            },
+            {
+                "revenue_bln": [100.0, 95.0, 90.0],
+                "net_income_bln": 10.0,
+                "equity_bln": 50.0,
+                "roic_pct": 18.0,
+                "ebit_margin_pct": 22.0,
+                "fcf_margin_pct": 12.0,
+                "debt_to_equity": 0.8,
+                "current_ratio": 1.5,
+                "shares_outstanding_mln": 1000.0,
+            },
+            {
+                "pe_ratio": 18.0,
+                "pb_ratio": 3.8,
+                "roe_pct": 14.0,
+                "revenue_growth_pct": 6.0,
+                "debt_to_equity": 0.9,
+                "pe_ratio_valid_count": 2,
+                "pb_ratio_valid_count": 2,
+                "peer_count_usable": 1,
+                "peer_count_weak": 2,
+                "peer_count_supported": 3,
+                "valuation_support_mode": "fallback",
+                "peer_confidence": "low",
+                "peer_baseline_reliability": "low",
+            },
+        )
+
+        self.assertTrue(metrics["valuation_enabled"])
+        self.assertTrue(metrics["valuation_low_confidence"])
+        self.assertTrue(metrics["valuation_fallback"])
+
     def test_peer_confidence_reduces_valuation_weight(self) -> None:
         base_metrics = {
             "roe_pct": 20.0,
@@ -922,8 +1065,10 @@ class ScoringSafetyTests(unittest.TestCase):
         )
 
         self.assertEqual(peer_averages["valuation_baseline_mode"], "thematic")
-        self.assertTrue(peer_averages["peer_baseline_insufficient"])
+        self.assertFalse(peer_averages["peer_baseline_insufficient"])
         self.assertEqual(peer_averages["peer_baseline_reliability"], "low")
+        self.assertEqual(peer_averages["valuation_support_mode"], "fallback")
+        self.assertTrue(peer_averages["valuation_low_confidence"])
         self.assertLess(peer_averages["revenue_growth_pct"], 30.0)
         self.assertNotEqual(peer_averages["pe_ratio"], 3.33)
 
@@ -952,6 +1097,36 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertTrue(any("Peer low confidence:" in warning for warning in warnings))
         self.assertIn("Usable peer set too small (<3); valuation was disabled", warnings)
         self.assertIn("Valuation skipped due to insufficient comparable peers", warnings)
+
+    def test_thematic_fallback_does_not_emit_disable_warning(self) -> None:
+        warnings = self.service._build_data_quality_warnings(
+            {"equity_bln": 10.0},
+            {"fed_funds_rate_pct": 4.0, "inflation_pct": 3.0, "unemployment_pct": 4.0},
+            {
+                "pe_ratio_valid_count": 3,
+                "pb_ratio_valid_count": 3,
+                "roe_pct_valid_count": 3,
+                "revenue_growth_pct_valid_count": 3,
+                "debt_to_equity_valid_count": 3,
+                "pe_ratio_baseline_noisy": True,
+                "pb_ratio_baseline_noisy": True,
+                "peer_selection_confidence": "low",
+                "peer_selection_source": "business_type",
+                "peer_group_sample_limited": True,
+                "peer_baseline_insufficient": False,
+                "peer_count_usable": 0,
+                "peer_count_weak": 3,
+                "valuation_support_mode": "fallback",
+                "valuation_low_confidence": True,
+                "valuation_fallback": True,
+                "valuation_baseline_mode": "thematic",
+            },
+            False,
+        )
+
+        self.assertNotIn("Usable peer set too small (<3); valuation was disabled", warnings)
+        self.assertNotIn("Valuation skipped due to insufficient comparable peers", warnings)
+        self.assertIn("Valuation uses a fallback peer baseline with limited comparable coverage", warnings)
 
     def test_peer_market_cap_warning_is_emitted(self) -> None:
         warnings = self.service._build_data_quality_warnings(
@@ -1390,7 +1565,7 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertEqual(peer_averages["peer_baseline_reliability"], "low")
         self.assertIsNone(peer_averages["pe_ratio"])
 
-    def test_peer_averages_exclude_rows_with_untrusted_market_cap(self) -> None:
+    def test_peer_averages_downweight_rows_with_untrusted_market_cap(self) -> None:
         peer_averages = self.service._build_peer_averages(
             [
                 {"ticker": "MSFT", "sector": "Technology", "industry": "Software - Infrastructure", "market_cap_bln": 3100.0, "pe_ratio": 30.0, "pb_ratio": 10.0, "roe_pct": 35.0, "revenue_growth_pct": 12.0, "debt_to_equity": 0.4},
@@ -1408,8 +1583,10 @@ class ScoringSafetyTests(unittest.TestCase):
 
         self.assertEqual(peer_averages["pe_ratio_valid_count"], 4)
         self.assertEqual(peer_averages["pb_ratio_valid_count"], 4)
-        self.assertEqual(peer_averages["pe_ratio"], 20.0)
-        self.assertAlmostEqual(peer_averages["pe_ratio_weighted_support"], 2.9, places=2)
+        self.assertAlmostEqual(peer_averages["pe_ratio"], 16.61, places=2)
+        self.assertAlmostEqual(peer_averages["pb_ratio"], 10.11, places=2)
+        self.assertAlmostEqual(peer_averages["pe_ratio_weighted_support"], 2.24, places=2)
+        self.assertEqual(peer_averages["valuation_support_mode"], "low_confidence")
         self.assertTrue(peer_averages["valuation_low_confidence"])
 
     def test_extended_or_thematic_peers_are_used_when_strict_set_is_below_three(self) -> None:
@@ -1631,7 +1808,7 @@ class ScoringSafetyTests(unittest.TestCase):
 
         self.assertEqual(low_peer_score, high_peer_score)
 
-    def test_peer_rows_hide_zero_quality_entries_from_ui(self) -> None:
+    def test_peer_rows_show_excluded_entries_with_reason(self) -> None:
         rows = self.service._peer_rows(
             [
                 {
@@ -1657,7 +1834,32 @@ class ScoringSafetyTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual([row.ticker for row in rows], ["GOOD"])
+        self.assertEqual([row.ticker for row in rows], ["GOOD", "TEST"])
+        self.assertEqual(rows[1].quality_class, "excluded")
+        self.assertEqual(rows[1].quality_note, "Excluded from baseline: no usable metrics")
+
+    def test_peer_rows_hide_suspect_market_cap_value_but_keep_warning_label(self) -> None:
+        rows = self.service._peer_rows(
+            [
+                {
+                    "ticker": "TM",
+                    "company": "Toyota",
+                    "sector": "Consumer Cyclical",
+                    "industry": "Auto Manufacturers",
+                    "market_cap_bln": 2771.07,
+                    "market_cap_status": "suspect",
+                    "quality_class": "weak",
+                    "quality_reasons": ["suspect_market_cap", "market_cap_outlier_vs_peers"],
+                    "pe_ratio": 10.0,
+                    "roe_pct": 11.0,
+                    "revenue_growth_pct": 7.0,
+                }
+            ]
+        )
+
+        self.assertEqual(rows[0].ticker, "TM")
+        self.assertIsNone(rows[0].market_cap_bln)
+        self.assertIn("suspect market cap", rows[0].quality_note.lower())
 
     def test_peer_baseline_exclusion_is_logged_with_reason(self) -> None:
         with self.assertLogs("app.services.analysis_runtime_service", level="INFO") as captured:

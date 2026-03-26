@@ -30,6 +30,7 @@ export type PeerRow = {
   roe_pct: number | null;
   revenue_growth_pct: number | null;
   quality_class: "usable" | "weak" | "excluded";
+  quality_note?: string | null;
 };
 
 export type FundamentalTrendPoint = {

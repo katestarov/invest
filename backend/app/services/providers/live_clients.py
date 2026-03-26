@@ -262,6 +262,7 @@ class YahooFinanceProvider(BaseHttpProvider):
             one_year_return = ((one_year_window[-1] / one_year_window[0]) - 1) * 100
 
         payload = {
+            "ticker": ticker,
             "company": meta.get("longName") or meta.get("shortName") or ticker,
             "currency": quote_result.get("currency") or meta.get("currency", "USD"),
             "current_price": round_or_none(_safe_number(meta.get("regularMarketPrice") or meta.get("previousClose")), 2),
@@ -529,6 +530,37 @@ class FredProvider(BaseHttpProvider):
             return None
         return _safe_number(observations[0]["value"])
 
+    def _year_over_year_pct(self, observations: list[dict]) -> float | None:
+        points: list[tuple[datetime, float]] = []
+        for item in observations:
+            observation_date = _parse_date(item.get("date"))
+            value = _safe_number(item.get("value"))
+            if observation_date is None or value is None:
+                continue
+            points.append((observation_date, value))
+        if len(points) < 2:
+            return None
+
+        ordered = sorted(points, key=lambda item: item[0], reverse=True)
+        current_date, current_value = ordered[0]
+        prior_candidates = [
+            (abs((current_date - date).days - 365), value)
+            for date, value in ordered[1:]
+            if 330 <= (current_date - date).days <= 400
+        ]
+        if not prior_candidates:
+            prior_candidates = [
+                (abs((current_date - date).days - 365), value)
+                for date, value in ordered[1:]
+                if (current_date - date).days >= 330
+            ]
+        if not prior_candidates:
+            return None
+
+        _, prior_value = min(prior_candidates, key=lambda item: item[0])
+        inflation_ratio = safe_ratio(current_value, prior_value)
+        return ((inflation_ratio - 1) * 100) if inflation_ratio is not None else None
+
     def fetch_macro_bundle(self) -> ProviderResult:
         if not self.api_key:
             return ProviderResult(
@@ -536,24 +568,17 @@ class FredProvider(BaseHttpProvider):
                 warnings=["FRED API key не задан, блок макроданных из FRED пропущен."],
             )
 
-        cpi_latest = self._latest_value("CPIAUCSL")
-        cpi_prev_year = self._get_json(
+        cpi_series = self._get_json(
             "https://api.stlouisfed.org/fred/series/observations",
             params={
                 "series_id": "CPIAUCSL",
                 "api_key": self.api_key,
                 "file_type": "json",
                 "sort_order": "desc",
-                "limit": 13,
+                "limit": 24,
             },
         )
-        cpi_values = [item for item in cpi_prev_year.get("observations", []) if item.get("value") not in {".", None}]
-        inflation = None
-        if len(cpi_values) >= 13:
-            current_cpi = _safe_number(cpi_values[0]["value"])
-            prior_cpi = _safe_number(cpi_values[12]["value"])
-            inflation_ratio = safe_ratio(current_cpi, prior_cpi)
-            inflation = ((inflation_ratio - 1) * 100) if inflation_ratio is not None else None
+        inflation = self._year_over_year_pct(cpi_series.get("observations", []) if isinstance(cpi_series, dict) else [])
 
         return ProviderResult(
             payload={

@@ -10,6 +10,9 @@ function displayValue(value: number | null, suffix = "") {
 }
 
 function qualityLabel(row: PeerRow) {
+  if (row.quality_note) {
+    return row.quality_note;
+  }
   if (row.quality_class === "weak") {
     return "Limited data";
   }

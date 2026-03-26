@@ -239,7 +239,11 @@ class AnalysisService:
         if cached is not None:
             return cached
 
-        company_market_cap = self._market_cap_bln(yahoo, edgar)
+        company_market_cap = self._market_cap_diagnostics(
+            yahoo,
+            edgar,
+            supplemental_market_caps=self._supplemental_market_cap_sources(company_profile.get("ticker")),
+        )["market_cap_bln"]
         company_profile = company_profile | {
             "market_cap_bln": company_market_cap,
             "revenue_bln_latest": (edgar.get("revenue_bln") or [None])[0],
@@ -259,6 +263,7 @@ class AnalysisService:
             "incompatible_peer_count": 0,
         }
         aggregated_candidate_tickers: list[str] = []
+        provider_batches: list[tuple[PeerDiscoveryResult, list[str]]] = []
         for provider in self.peer_providers:
             discovery = provider.discover(company_profile["ticker"], company_profile)
             candidate_tickers = self._filter_candidate_tickers_by_business_type(
@@ -269,50 +274,73 @@ class AnalysisService:
             if not candidate_tickers:
                 continue
             aggregated_candidate_tickers = list(dict.fromkeys(aggregated_candidate_tickers + candidate_tickers))
-            rows = self._fetch_peer_rows(aggregated_candidate_tickers, company_profile["ticker"])
+            provider_batches.append((discovery, candidate_tickers))
+
+        if not aggregated_candidate_tickers:
+            self.peer_group_cache.set(cache_key, (fallback_rows, fallback_meta))
+            return fallback_rows, fallback_meta
+
+        rows = self._fetch_peer_rows(aggregated_candidate_tickers, company_profile["ticker"])
+        source_meta = fallback_meta
+        cumulative_candidate_tickers: list[str] = []
+        for discovery, batch_tickers in provider_batches:
+            cumulative_candidate_tickers = list(dict.fromkeys(cumulative_candidate_tickers + batch_tickers))
+            cumulative_ticker_set = set(cumulative_candidate_tickers)
+            cumulative_rows = [row for row in rows if row.get("ticker") in cumulative_ticker_set]
             selected_rows, selection_meta = self._select_peers_from_candidates(
                 company_profile,
-                rows,
+                cumulative_rows,
                 company_market_cap,
-                aggregated_candidate_tickers,
+                cumulative_candidate_tickers,
             )
             selection_meta["peer_selection_reason"] = discovery.reason
             selection_meta["peer_selection_source"] = discovery.source
             if selected_rows and self._is_better_peer_selection(selection_meta, fallback_meta):
                 fallback_rows, fallback_meta = selected_rows, selection_meta
             if self._peer_selection_is_sufficient(selected_rows, selection_meta, discovery):
-                self.peer_group_cache.set(cache_key, (selected_rows, selection_meta))
-                return selected_rows, selection_meta
+                source_meta = selection_meta
+                break
+            if selected_rows and self._is_better_peer_selection(selection_meta, source_meta):
+                source_meta = selection_meta
 
-        self.peer_group_cache.set(cache_key, (fallback_rows, fallback_meta))
-        return fallback_rows, fallback_meta
+        final_rows, final_meta = self._select_peers_from_candidates(
+            company_profile,
+            rows,
+            company_market_cap,
+            aggregated_candidate_tickers,
+        )
+        if not final_rows and fallback_rows:
+            self.peer_group_cache.set(cache_key, (fallback_rows, fallback_meta))
+            return fallback_rows, fallback_meta
+
+        final_meta["peer_selection_reason"] = source_meta.get("peer_selection_reason", fallback_meta["peer_selection_reason"])
+        final_meta["peer_selection_source"] = source_meta.get("peer_selection_source", fallback_meta["peer_selection_source"])
+        display_rows = self._build_peer_display_rows(company_profile, rows, company_market_cap, final_meta)
+        self.peer_group_cache.set(cache_key, (display_rows or final_rows, final_meta))
+        return display_rows or final_rows, final_meta
 
     def _build_silver_metrics(self, yahoo: dict, edgar: dict, peers: dict, is_bank_like: bool = False) -> dict:
         revenue_cagr_like = self._revenue_cagr_like_pct(edgar)
-        market_cap_diagnostics = self._market_cap_diagnostics(yahoo, edgar)
+        market_cap_diagnostics = self._market_cap_diagnostics(
+            yahoo,
+            edgar,
+            supplemental_market_caps=self._supplemental_market_cap_sources(yahoo.get("ticker")),
+        )
         market_cap_bln = market_cap_diagnostics["market_cap_bln"]
         roe_assessment = self._roe_assessment(edgar, market_cap_bln)
-        pe_ratio = self._pe_ratio(yahoo, edgar)
-        pb_ratio = self._pb_ratio(yahoo, edgar)
+        pe_ratio = round_or_none(safe_ratio(market_cap_bln, edgar.get("net_income_bln")), 2)
+        pb_ratio = round_or_none(safe_ratio(market_cap_bln, edgar.get("equity_bln")), 2)
         revenue_growth_pct = self._revenue_growth_pct(edgar)
         peer_confidence = peers.get("peer_confidence", peers.get("peer_selection_confidence", "low"))
         peer_count_usable = peers.get("peer_count_usable", 0)
         peer_count_weak = peers.get("peer_count_weak", 0)
         minimum_usable_peers = max(3, self.peer_min_valid_count)
-        low_confidence_support_threshold = max(2.5, minimum_usable_peers - 0.5)
-        valuation_low_confidence = bool(
-            peer_count_usable >= 2
-            and peers.get("peer_support_effective", 0.0) >= low_confidence_support_threshold
-            and peers.get("pe_ratio_weighted_support", 0.0) >= low_confidence_support_threshold
-            and peers.get("pb_ratio_weighted_support", 0.0) >= low_confidence_support_threshold
-        )
+        valuation_support_mode = str(peers.get("valuation_support_mode") or self._valuation_support_mode(peer_count_usable, peer_count_weak))
+        valuation_low_confidence = valuation_support_mode in {"low_confidence", "fallback"}
         valuation_enabled = bool(
-            (
-                peer_count_usable >= minimum_usable_peers
-                and peers.get("pe_ratio_valid_count", 0) >= minimum_usable_peers
-                and peers.get("pb_ratio_valid_count", 0) >= minimum_usable_peers
-            )
-            or valuation_low_confidence
+            valuation_support_mode != "disabled"
+            and peers.get("pe_ratio") is not None
+            and peers.get("pb_ratio") is not None
         )
         pe_premium_pct = round_or_none(premium_pct(pe_ratio, peers["pe_ratio"]), 2) if valuation_enabled else None
         pb_premium_pct = round_or_none(premium_pct(pb_ratio, peers["pb_ratio"]), 2) if valuation_enabled else None
@@ -359,12 +387,15 @@ class AnalysisService:
             "peer_count_total": peers.get("peer_count_total", peers.get("peer_count", 0)),
             "peer_count_usable": peer_count_usable,
             "peer_count_weak": peer_count_weak,
+            "peer_count_supported": peers.get("peer_count_supported", peer_count_usable + peer_count_weak),
             "peer_baseline_reliability": peers.get("peer_baseline_reliability", "low"),
             "valuation_baseline_mode": peers.get("valuation_baseline_mode", "peer"),
+            "valuation_support_mode": valuation_support_mode,
             "peer_selection_confidence": peers.get("peer_selection_confidence", "low"),
             "peer_selection_reason": peers.get("peer_selection_reason", "fallback"),
             "valuation_enabled": valuation_enabled,
             "valuation_low_confidence": valuation_low_confidence,
+            "valuation_fallback": valuation_support_mode == "fallback",
             "profitability_reliability_multiplier": roe_assessment["weight_multiplier"],
             "pe_premium_pct": pe_premium_pct,
             "pb_premium_pct": pb_premium_pct,
@@ -420,7 +451,12 @@ class AnalysisService:
             try:
                 yahoo_payload = self.yahoo.fetch_company_bundle(peer_ticker).payload
                 edgar_payload = self.edgar.fetch_company_bundle(peer_ticker).payload
-                market_cap_diagnostics = self._market_cap_diagnostics(yahoo_payload, edgar_payload)
+                market_cap_diagnostics = self._market_cap_diagnostics(
+                    yahoo_payload,
+                    edgar_payload,
+                    supplemental_market_caps=self._supplemental_market_cap_sources(peer_ticker),
+                )
+                peer_market_cap_bln = market_cap_diagnostics["market_cap_bln"]
                 row = self._annotate_peer_row(
                     {
                         "ticker": peer_ticker,
@@ -433,11 +469,11 @@ class AnalysisService:
                         "market_cap_status": market_cap_diagnostics["status"],
                         "market_cap_suspect": market_cap_diagnostics["suspect"],
                         "market_cap_warning": market_cap_diagnostics["warning"],
-                        "pe_ratio": self._pe_ratio(yahoo_payload, edgar_payload),
-                        "pb_ratio": self._pb_ratio(yahoo_payload, edgar_payload),
+                        "pe_ratio": round_or_none(safe_ratio(peer_market_cap_bln, edgar_payload.get("net_income_bln")), 2),
+                        "pb_ratio": round_or_none(safe_ratio(peer_market_cap_bln, edgar_payload.get("equity_bln")), 2),
                         "roe_pct": self._roe_assessment(
                             edgar_payload,
-                            self._market_cap_bln(yahoo_payload, edgar_payload),
+                            peer_market_cap_bln,
                         )["score_input_pct"],
                         "revenue_growth_pct": self._revenue_growth_pct(edgar_payload),
                         "revenue_bln": (edgar_payload.get("revenue_bln") or [None])[0],
@@ -479,7 +515,7 @@ class AnalysisService:
         contextual_candidates = self._apply_peer_quality_context(candidates, company_market_cap)
         scored_candidates = self._rank_peer_candidates(company_profile, contextual_candidates, company_market_cap)
         scored_manual = [item for item in scored_candidates if item[1]["ticker"] in manual_tickers]
-        manual_valid = len([1 for _, candidate, _, _ in scored_manual if self._peer_is_usable_for_baseline(candidate)])
+        manual_valid = len([1 for _, candidate, _, _ in scored_manual if self._peer_supports_baseline(candidate)])
         ranked = sorted(scored_manual if manual_valid >= 3 else scored_candidates, key=lambda item: item[0], reverse=True)
 
         strict_ranked = [item for item in ranked if item[2] == "strict"]
@@ -487,7 +523,6 @@ class AnalysisService:
         fallback_ranked = [item for item in ranked if item[2] == "fallback"]
         strict_usable = [item for item in strict_ranked if self._peer_is_usable_for_baseline(item[1])]
         extended_usable = [item for item in strict_ranked + extended_ranked if self._peer_is_usable_for_baseline(item[1])]
-        fallback_usable = [item for item in strict_ranked + extended_ranked + fallback_ranked if self._peer_is_usable_for_baseline(item[1])]
         strict_supported = [item for item in strict_ranked if self._peer_supports_baseline(item[1])]
         extended_supported = [item for item in strict_ranked + extended_ranked if self._peer_supports_baseline(item[1])]
         fallback_supported = [item for item in strict_ranked + extended_ranked + fallback_ranked if self._peer_supports_baseline(item[1])]
@@ -496,11 +531,11 @@ class AnalysisService:
         chosen_ranked = strict_ranked + extended_ranked + fallback_ranked
         supported_ranked = fallback_supported
         minimum_usable_peers = max(3, self.peer_min_valid_count)
-        if len(strict_usable) >= minimum_usable_peers:
+        if len(strict_supported) >= minimum_usable_peers and strict_usable:
             peer_selection_mode = "strict"
             chosen_ranked = strict_ranked
             supported_ranked = strict_supported
-        elif len(extended_usable) >= minimum_usable_peers:
+        elif len(extended_supported) >= minimum_usable_peers and extended_usable:
             peer_selection_mode = "extended"
             chosen_ranked = strict_ranked + extended_ranked
             supported_ranked = extended_supported
@@ -508,6 +543,7 @@ class AnalysisService:
         selected = [candidate for _, candidate, _, _ in supported_ranked[: self.peer_target_count]]
         usable_selected = [candidate for candidate in selected if candidate.get("quality_class") == "usable"]
         weak_selected = [candidate for candidate in selected if candidate.get("quality_class") == "weak"]
+        supported_selected = usable_selected + weak_selected
         top_score = supported_ranked[0][0] if supported_ranked else 0.0
         average_score = sum(score for score, _, _, _ in supported_ranked[: self.peer_target_count]) / max(len(selected), 1) if selected else 0.0
         matching_business_types = sum(
@@ -540,9 +576,9 @@ class AnalysisService:
         sample_mode = "excluded"
         if len(usable_selected) >= self.peer_target_count:
             sample_mode = "full"
-        elif len(usable_selected) >= minimum_usable_peers:
+        elif len(supported_selected) >= minimum_usable_peers:
             sample_mode = "limited"
-        elif len(usable_selected) >= 1:
+        elif len(supported_selected) >= 1:
             sample_mode = "very_small"
         if quality_passed and any(level == "WEAK" for level in compatibility_levels) and len(selected) >= 3:
             quality_passed = False
@@ -551,7 +587,9 @@ class AnalysisService:
         confidence = "low"
         if peer_selection_mode == "strict" and sample_mode == "full" and top_score >= 4.5 and strong_peer_count >= 2:
             confidence = "high"
-        elif peer_selection_mode in {"strict", "extended"} and len(usable_selected) >= 2:
+        elif peer_selection_mode in {"strict", "extended"} and (len(usable_selected) >= 2 or len(supported_selected) >= minimum_usable_peers):
+            confidence = "medium"
+        elif peer_selection_mode == "fallback" and len(supported_selected) >= minimum_usable_peers:
             confidence = "medium"
         elif peer_selection_mode == "fallback" and len(usable_selected) >= 1:
             confidence = "low"
@@ -577,6 +615,7 @@ class AnalysisService:
             "peer_count_total": len(selected),
             "peer_count_usable": len(usable_selected),
             "peer_count_weak": len(weak_selected),
+            "peer_count_supported": len(supported_selected),
             "peer_support_effective": round(sum(float(candidate.get("baseline_weight", 0.0)) for candidate in selected), 2),
             "target_peer_count": self.peer_target_count,
             "peer_expansion_level": expansion_level,
@@ -595,7 +634,9 @@ class AnalysisService:
     ) -> bool:
         if selection_meta.get("peer_selection_mode") == "strict" and selection_meta.get("peer_sample_mode") == "full":
             return True
-        if selection_meta.get("peer_selection_mode") == "extended" and selection_meta.get("peer_count_usable", 0) >= max(3, self.peer_min_valid_count):
+        if selection_meta.get("peer_selection_mode") == "extended" and selection_meta.get("peer_count_supported", 0) >= max(3, self.peer_min_valid_count):
+            return True
+        if selection_meta.get("peer_selection_mode") == "fallback" and selection_meta.get("peer_count_supported", 0) >= max(3, self.peer_min_valid_count):
             return True
         return False
 
@@ -796,7 +837,7 @@ class AnalysisService:
         if company_profile.get("sector") == candidate.get("sector"):
             score += 0.75
 
-        candidate_market_cap = None if candidate.get("market_cap_suspect") else candidate.get("market_cap_bln")
+        candidate_market_cap = candidate.get("market_cap_bln") if self._peer_market_cap_status(candidate) == "valid" else None
         score += self._relative_scale_score(
             company_market_cap,
             candidate_market_cap,
@@ -979,13 +1020,12 @@ class AnalysisService:
             return list(cached)
 
         reasons: list[str] = []
-        if self._peer_market_cap_status(candidate) == "invalid":
-            reasons.append("invalid_market_cap")
-        if self._peer_metric_count(candidate) == 0:
+        metric_count = self._peer_metric_count(candidate)
+        if metric_count == 0:
+            if self._peer_market_cap_status(candidate) == "invalid":
+                reasons.append("invalid_market_cap")
             reasons.append("empty_fundamentals")
-        if self._peer_metric_count(candidate) <= 1:
-            reasons.append("nearly_empty_fundamentals")
-        if self._peer_preview_score(candidate) == 0.0 and self._peer_metric_count(candidate) <= 1:
+        if self._peer_preview_score(candidate) == 0.0 and metric_count == 0:
             reasons.append("zero_score_empty_row")
         return reasons
 
@@ -1001,6 +1041,8 @@ class AnalysisService:
         market_cap_status = self._peer_market_cap_status(candidate)
         if market_cap_status == "suspect":
             reasons.append("suspect_market_cap")
+        elif market_cap_status == "invalid":
+            reasons.append("invalid_market_cap")
         if market_cap is not None and market_cap <= self._peer_market_cap_floor_bln(company_market_cap):
             reasons.append("small_market_cap")
         if market_cap is not None and company_market_cap is not None and company_market_cap > 0:
@@ -1011,7 +1053,7 @@ class AnalysisService:
                 reasons.append("market_cap_outlier_vs_peers")
         if not self._peer_has_known_classification(candidate):
             reasons.append("missing_sector_or_industry")
-        if self._peer_metric_count(candidate) == 2:
+        if self._peer_metric_count(candidate) <= 1:
             reasons.append("limited_fundamentals")
         ticker = str(candidate.get("ticker") or "").upper()
         if len(ticker) == 5 and ticker.endswith(("F", "Y", "Q")):
@@ -1019,7 +1061,25 @@ class AnalysisService:
         return list(dict.fromkeys(reasons))
 
     def _peer_quality_weight(self, quality_class: str) -> float:
-        return {"usable": 1.0, "weak": 0.45, "excluded": 0.0}.get(quality_class, 0.0)
+        return {"usable": 1.0, "weak": 0.4, "excluded": 0.0}.get(quality_class, 0.0)
+
+    def _valuation_support_mode(self, usable_count: int, weak_count: int, *, allow_all_weak: bool = False) -> str:
+        minimum_usable_peers = max(3, self.peer_min_valid_count)
+        supported_count = usable_count + weak_count
+        if usable_count >= minimum_usable_peers:
+            return "normal"
+        if usable_count >= 2 and supported_count >= minimum_usable_peers:
+            return "low_confidence"
+        if supported_count >= minimum_usable_peers and (usable_count >= 1 or allow_all_weak):
+            return "fallback"
+        return "disabled"
+
+    def _metric_support_is_sufficient(self, support_mode: str, valid_count: int) -> bool:
+        if support_mode == "normal":
+            return valid_count >= max(3, self.peer_min_valid_count)
+        if support_mode in {"low_confidence", "fallback"}:
+            return valid_count >= 2
+        return False
 
     def _weighted_quantile(self, values: list[tuple[float, float]], quantile: float) -> float | None:
         if not values:
@@ -1053,13 +1113,10 @@ class AnalysisService:
 
         total_weight = sum(weight for _, weight in weighted_values)
         raw_values = [value for value, _ in weighted_values]
-        if prefer_median:
-            baseline = self._weighted_quantile(weighted_values, 0.5)
-        else:
-            lower = self._weighted_quantile(weighted_values, 0.1) or min(raw_values)
-            upper = self._weighted_quantile(weighted_values, 0.9) or max(raw_values)
-            clipped = [(min(max(value, lower), upper), weight) for value, weight in weighted_values]
-            baseline = sum(value * weight for value, weight in clipped) / total_weight if total_weight > 0 else None
+        lower = self._weighted_quantile(weighted_values, 0.1) or min(raw_values)
+        upper = self._weighted_quantile(weighted_values, 0.9) or max(raw_values)
+        clipped = [(min(max(value, lower), upper), weight) for value, weight in weighted_values]
+        baseline = sum(value * weight for value, weight in clipped) / total_weight if total_weight > 0 else None
 
         midpoint = float(median(raw_values))
         positive_values = [value for value in raw_values if value > 0]
@@ -1115,7 +1172,15 @@ class AnalysisService:
         return max(0.5, min(company_market_cap * 0.01, 15.0))
 
     def _peer_selection_exclusion_reasons(self, company_market_cap: float | None, candidate: dict) -> list[str]:
-        return list(self._peer_baseline_exclusion_reasons(candidate))
+        reasons = list(self._peer_baseline_exclusion_reasons(candidate))
+        market_cap = candidate.get("market_cap_bln")
+        if (
+            self._peer_metric_count(candidate) <= 1
+            and market_cap is not None
+            and market_cap <= self._peer_market_cap_floor_bln(company_market_cap)
+        ):
+            reasons.append("tiny_cap_sparse_peer")
+        return list(dict.fromkeys(reasons))
 
     def _log_peer_exclusion(self, candidate: dict, scope: str, reasons: list[str]) -> None:
         logger.info(
@@ -1153,14 +1218,17 @@ class AnalysisService:
                 market_cap_status = "suspect"
             exclusion_reasons = self._peer_baseline_exclusion_reasons(peer | {"market_cap_status": market_cap_status})
             quality_class = "excluded" if exclusion_reasons else "weak" if weak_reasons else "usable"
+            baseline_weight = self._peer_quality_weight(quality_class)
+            if market_cap_status in {"suspect", "invalid"} and baseline_weight > 0:
+                baseline_weight *= 0.3
             contextual_peers.append(
                 peer
                 | {
                     "market_cap_status": market_cap_status,
-                    "market_cap_suspect": market_cap_status == "suspect",
+                    "market_cap_suspect": market_cap_status in {"suspect", "invalid"},
                     "quality_class": quality_class,
                     "quality_reasons": exclusion_reasons or weak_reasons,
-                    "baseline_weight": self._peer_quality_weight(quality_class),
+                    "baseline_weight": round(baseline_weight, 2),
                     "baseline_eligible": quality_class != "excluded",
                     "baseline_exclusion_reasons": exclusion_reasons,
                 }
@@ -1189,6 +1257,76 @@ class AnalysisService:
             filtered.append(peer)
         return filtered
 
+    def _build_peer_display_rows(
+        self,
+        company_profile: dict,
+        peers: list[dict],
+        company_market_cap: float | None,
+        peer_selection: dict,
+    ) -> list[dict]:
+        if not peer_selection.get("baseline_peer_tickers"):
+            return []
+
+        contextual_peers = self._apply_peer_quality_context(peers, company_market_cap)
+        peer_by_ticker = {peer.get("ticker"): peer for peer in contextual_peers}
+        ranked_candidates = self._rank_peer_candidates(company_profile, contextual_peers, company_market_cap)
+        ordered: list[dict] = []
+        seen: set[str] = set()
+
+        def append_peer(peer: dict | None) -> None:
+            if not peer:
+                return
+            ticker = str(peer.get("ticker") or "")
+            if not ticker or ticker in seen:
+                return
+            seen.add(ticker)
+            ordered.append(peer | {"peer_display_rank": len(ordered)})
+
+        for ticker in peer_selection.get("baseline_peer_tickers", []):
+            append_peer(peer_by_ticker.get(ticker))
+        for _, candidate, _, _ in ranked_candidates:
+            append_peer(candidate)
+        excluded_peers = sorted(
+            [peer for peer in contextual_peers if peer.get("quality_class") == "excluded"],
+            key=lambda item: (float(item.get("peer_metric_count", 0)), float(item.get("peer_preview_score", 0.0))),
+            reverse=True,
+        )
+        for candidate in excluded_peers:
+            append_peer(candidate)
+        return ordered[:8]
+
+    def _peer_quality_reason_text(self, reason: str) -> str:
+        return {
+            "invalid_market_cap": "invalid market cap",
+            "empty_fundamentals": "no usable metrics",
+            "zero_score_empty_row": "no usable metrics",
+            "suspect_market_cap": "suspect market cap",
+            "small_market_cap": "tiny market cap",
+            "market_cap_far_from_company": "market cap far from company",
+            "market_cap_outlier_vs_peers": "market cap outlier vs peers",
+            "missing_sector_or_industry": "missing sector/industry",
+            "limited_fundamentals": "only 1 metric available",
+            "otc_like_ticker": "OTC-like ticker",
+        }.get(reason, reason.replace("_", " "))
+
+    def _peer_quality_note(self, peer: dict) -> str | None:
+        quality_class = str(peer.get("quality_class") or "usable")
+        raw_reasons = peer.get("quality_reasons") or peer.get("baseline_exclusion_reasons") or []
+        reasons = list(dict.fromkeys(self._peer_quality_reason_text(str(reason)) for reason in raw_reasons))[:2]
+        if quality_class == "weak":
+            return f"Limited data: {', '.join(reasons)}" if reasons else "Limited data"
+        if quality_class == "excluded":
+            return f"Excluded from baseline: {', '.join(reasons)}" if reasons else "Excluded from baseline"
+        return None
+
+    def _peer_market_cap_display_value(self, peer: dict) -> float | None:
+        raw_reasons = {str(reason) for reason in (peer.get("quality_reasons") or peer.get("baseline_exclusion_reasons") or [])}
+        if str(peer.get("market_cap_status") or "").lower() in {"suspect", "invalid"} and raw_reasons.intersection(
+            {"suspect_market_cap", "market_cap_far_from_company", "market_cap_outlier_vs_peers", "invalid_market_cap"}
+        ):
+            return None
+        return round_or_none(peer.get("market_cap_bln"), 2)
+
     def _build_peer_averages(self, peers: list[dict], peer_selection: dict, yahoo: dict, edgar: dict) -> dict:
         company_market_cap = self._market_cap_bln(yahoo, edgar)
         eligible_peers = self._filter_peer_candidates(peers, scope="baseline", company_market_cap=company_market_cap)
@@ -1196,23 +1334,29 @@ class AnalysisService:
         baseline_tickers = set(peer_selection.get("baseline_peer_tickers", []))
         supported_rows = [row for row in eligible_peers if not baseline_tickers or row.get("ticker") in baseline_tickers]
         usable_rows = [row for row in supported_rows if row.get("ticker") in usable_tickers and row.get("quality_class") == "usable"]
+        weak_rows = [row for row in supported_rows if row.get("quality_class") == "weak"]
         minimum_usable_peers = max(3, self.peer_min_valid_count)
-        low_confidence_support_threshold = max(2.5, minimum_usable_peers - 0.5)
         supported_effective = round(sum(float(row.get("baseline_weight", 0.0)) for row in supported_rows), 2)
-        supports_low_confidence = len(usable_rows) >= 2 and supported_effective >= low_confidence_support_threshold
-        minimum_usable_peers = max(3, self.peer_min_valid_count)
+        support_mode = self._valuation_support_mode(len(usable_rows), len(weak_rows))
         baseline_mode = "peer"
-        baseline_rows = supported_rows if len(usable_rows) >= minimum_usable_peers or supports_low_confidence else []
+        baseline_rows = supported_rows if support_mode != "disabled" else []
         company_ticker = str(peer_selection.get("company_ticker") or "").upper()
-        if self._is_mega_cap_tech_company(company_ticker) and len(usable_rows) < minimum_usable_peers and len(eligible_peers) >= minimum_usable_peers:
+        if self._is_mega_cap_tech_company(company_ticker) and support_mode == "disabled" and len(eligible_peers) >= minimum_usable_peers:
             baseline_rows = eligible_peers
             baseline_mode = "thematic"
-        elif len(usable_rows) < minimum_usable_peers and len(eligible_peers) >= minimum_usable_peers:
+        elif support_mode == "disabled" and len(eligible_peers) >= minimum_usable_peers:
             baseline_rows = eligible_peers
             baseline_mode = "fallback"
-        elif len(usable_rows) < minimum_usable_peers:
+        elif support_mode == "disabled":
             baseline_rows = []
             baseline_mode = "neutral"
+        baseline_usable_rows = [row for row in baseline_rows if row.get("quality_class") == "usable"]
+        baseline_weak_rows = [row for row in baseline_rows if row.get("quality_class") == "weak"]
+        support_mode = self._valuation_support_mode(
+            len(baseline_usable_rows),
+            len(baseline_weak_rows),
+            allow_all_weak=baseline_mode in {"thematic", "fallback"},
+        )
         baseline_candidates = baseline_rows or []
         metric_rows = {
             "pe_ratio": [row for row in baseline_candidates if row.get("pe_ratio") is not None],
@@ -1254,29 +1398,93 @@ class AnalysisService:
             averages[f"{metric}_baseline_noisy"] = noisy
             averages[f"{metric}_weighted_support"] = weighted_support
         averages["valuation_baseline_mode"] = baseline_mode
-        averages["peer_baseline_insufficient"] = len(usable_rows) < minimum_usable_peers and not supports_low_confidence
-        averages["peer_baseline_reliability"] = "high" if len(usable_rows) >= self.peer_target_count else "medium" if len(usable_rows) >= minimum_usable_peers else "low"
-        averages["peer_count_supported"] = len(supported_rows)
-        averages["peer_count_weak"] = len([row for row in supported_rows if row.get("quality_class") == "weak"])
-        averages["peer_support_effective"] = supported_effective
-        averages["valuation_low_confidence"] = supports_low_confidence and len(usable_rows) < minimum_usable_peers
+        averages["valuation_support_mode"] = support_mode
+        averages["peer_baseline_insufficient"] = support_mode == "disabled"
+        averages["peer_baseline_reliability"] = (
+            "high"
+            if len(baseline_usable_rows) >= self.peer_target_count
+            else "medium"
+            if support_mode == "normal"
+            else "low"
+        )
+        averages["peer_count_supported"] = len(baseline_usable_rows) + len(baseline_weak_rows)
+        averages["peer_count_usable"] = len(baseline_usable_rows)
+        averages["peer_count_weak"] = len(baseline_weak_rows)
+        averages["peer_support_effective"] = round(sum(float(row.get("baseline_weight", 0.0)) for row in baseline_rows), 2)
+        averages["valuation_low_confidence"] = support_mode in {"low_confidence", "fallback"}
+        averages["valuation_fallback"] = support_mode == "fallback"
 
-        if averages.get("pe_ratio") is None or (
-            averages.get("pe_ratio_valid_count", 0) < minimum_usable_peers
-            and not (averages.get("pe_ratio_valid_count", 0) >= 2 and averages.get("pe_ratio_weighted_support", 0.0) >= low_confidence_support_threshold)
-        ):
+        if averages.get("pe_ratio") is None or not self._metric_support_is_sufficient(support_mode, averages.get("pe_ratio_valid_count", 0)):
             averages["pe_ratio"] = None
             averages["pe_ratio_baseline_noisy"] = True
-        if averages.get("pb_ratio") is None or (
-            averages.get("pb_ratio_valid_count", 0) < minimum_usable_peers
-            and not (averages.get("pb_ratio_valid_count", 0) >= 2 and averages.get("pb_ratio_weighted_support", 0.0) >= low_confidence_support_threshold)
-        ):
+        if averages.get("pb_ratio") is None or not self._metric_support_is_sufficient(support_mode, averages.get("pb_ratio_valid_count", 0)):
             averages["pb_ratio"] = None
             averages["pb_ratio_baseline_noisy"] = True
         return averages
 
     def _is_mega_cap_tech_company(self, ticker: str | None) -> bool:
         return str(ticker or "").upper() in {"AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"}
+
+    def _supplemental_market_cap_sources(self, ticker: str | None) -> list[tuple[str, float | None, str | None]]:
+        normalized_ticker = str(ticker or "").upper().strip()
+        if not normalized_ticker:
+            return []
+        sources: list[tuple[str, float | None, str | None]] = []
+        for provider in getattr(self, "peer_providers", []):
+            fetch_market_cap_snapshot = getattr(provider, "fetch_market_cap_snapshot", None)
+            if not callable(fetch_market_cap_snapshot):
+                continue
+            try:
+                snapshot = fetch_market_cap_snapshot(normalized_ticker)
+            except Exception as exc:
+                logger.warning(
+                    "peer_market_cap_fetch_failed",
+                    extra={
+                        "ticker": normalized_ticker,
+                        "provider": getattr(provider, "source_name", "unknown"),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                continue
+            if not snapshot:
+                continue
+            market_cap_bln, currency = snapshot
+            sources.append((f"{getattr(provider, 'source_name', 'unknown')}_market_cap", market_cap_bln, currency))
+        return sources
+
+    def _market_cap_source_family(self, source_name: str) -> str:
+        normalized = str(source_name or "").lower()
+        if normalized in {"yahoo_quote", "price_x_quote_shares"}:
+            return "yahoo_quote"
+        if normalized == "price_x_sec_shares":
+            return "sec_shares"
+        if normalized.startswith("fmp"):
+            return "fmp"
+        if normalized.startswith("finnhub"):
+            return "finnhub"
+        return normalized or "unknown"
+
+    def _market_cap_consensus_cluster(self, candidates: list[tuple[str, float]]) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        ordered = sorted(candidates, key=lambda item: item[1])
+        clusters: list[list[tuple[str, float]]] = [[ordered[0]]]
+        for candidate in ordered[1:]:
+            previous_value = clusters[-1][-1][1]
+            ratio = candidate[1] / max(previous_value, 0.0001)
+            if ratio <= 1.8:
+                clusters[-1].append(candidate)
+            else:
+                clusters.append([candidate])
+
+        def cluster_rank(cluster: list[tuple[str, float]]) -> tuple[int, int, float, float]:
+            values = [value for _, value in cluster]
+            distinct_families = len({self._market_cap_source_family(source_name) for source_name, _ in cluster})
+            spread_ratio = max(values) / max(min(values), 0.0001)
+            center = float(median(values))
+            return distinct_families, -spread_ratio, len(cluster), -center
+
+        return max(clusters, key=cluster_rank)
 
     def _market_cap_currency_is_supported(self, currency: str | None) -> bool:
         return str(currency or "").upper() == "USD"
@@ -1286,7 +1494,12 @@ class AnalysisService:
             return False
         return 0.01 <= market_cap_bln <= 7_500.0
 
-    def _market_cap_diagnostics(self, yahoo: dict, edgar: dict) -> dict[str, float | bool | str | None]:
+    def _market_cap_diagnostics(
+        self,
+        yahoo: dict,
+        edgar: dict,
+        supplemental_market_caps: list[tuple[str, float | None, str | None]] | None = None,
+    ) -> dict[str, float | bool | str | None]:
         price = yahoo.get("current_price")
         shares_mln = edgar.get("shares_outstanding_mln")
         quote_shares_mln = yahoo.get("shares_outstanding_quote_mln")
@@ -1315,22 +1528,35 @@ class AnalysisService:
                 source_candidates.append(("price_x_quote_shares", price_x_quote))
             elif quote_currency == "USD" and quote_market_cap is not None:
                 warnings.append("quote shares were available but price currency required USD fallback")
+        for source_name, source_market_cap, source_currency in supplemental_market_caps or []:
+            normalized_market_cap = round_or_none(source_market_cap, 2)
+            normalized_currency = str(source_currency or "").upper()
+            if normalized_market_cap is None or normalized_market_cap <= 0:
+                continue
+            if normalized_currency and not self._market_cap_currency_is_supported(normalized_currency):
+                warnings.append(f"{source_name} currency {normalized_currency} could not be normalized to USD")
+                continue
+            source_candidates.append((source_name, normalized_market_cap))
 
         chosen_market_cap: float | None = None
         source: str | None = None
         status = "invalid"
         if source_candidates:
-            values = sorted(value for _, value in source_candidates if value is not None and value > 0)
-            chosen_market_cap = round_or_none(float(median(values)), 2) if values else None
-            source = source_candidates[0][0] if len(source_candidates) == 1 else "median_of_sources"
-            status = "valid"
-            if len(values) >= 2 and min(values) > 0:
-                factor_gap = max(values) / min(values)
-                if factor_gap >= 2.5:
-                    status = "suspect"
-                    warnings.append("market cap sources disagree materially; using median/fallback estimate")
-            if quote_currency == "USD" and currency != "USD" and quote_market_cap is not None:
-                warnings.append(f"price currency {currency} required quote-based USD fallback")
+            valid_candidates = [(source_name, value) for source_name, value in source_candidates if value is not None and value > 0]
+            if valid_candidates:
+                values = sorted(value for _, value in valid_candidates)
+                consensus_candidates = self._market_cap_consensus_cluster(valid_candidates)
+                consensus_values = [value for _, value in consensus_candidates]
+                chosen_market_cap = round_or_none(float(median(consensus_values)), 2) if consensus_values else None
+                source = consensus_candidates[0][0] if len(consensus_candidates) == 1 else "median_of_sources"
+                status = "valid"
+                if len(values) >= 2 and min(values) > 0:
+                    factor_gap = max(values) / min(values)
+                    if factor_gap > 3.0 or len(consensus_candidates) < len(valid_candidates):
+                        status = "suspect"
+                        warnings.append("market cap sources disagree materially; using median/fallback estimate")
+                if quote_currency == "USD" and currency != "USD" and quote_market_cap is not None:
+                    warnings.append(f"price currency {currency} required quote-based USD fallback")
 
         if chosen_market_cap is not None and not self._market_cap_in_plausible_range(chosen_market_cap):
             chosen_market_cap = None
@@ -1351,8 +1577,13 @@ class AnalysisService:
             "warning": " | ".join(dict.fromkeys(warnings)) if warnings else None,
         }
 
-    def _market_cap_bln(self, yahoo: dict, edgar: dict) -> float | None:
-        return self._market_cap_diagnostics(yahoo, edgar)["market_cap_bln"]
+    def _market_cap_bln(
+        self,
+        yahoo: dict,
+        edgar: dict,
+        supplemental_market_caps: list[tuple[str, float | None, str | None]] | None = None,
+    ) -> float | None:
+        return self._market_cap_diagnostics(yahoo, edgar, supplemental_market_caps=supplemental_market_caps)["market_cap_bln"]
 
     def _pe_ratio(self, yahoo: dict, edgar: dict) -> float | None:
         market_cap = self._market_cap_bln(yahoo, edgar)
@@ -1544,7 +1775,6 @@ class AnalysisService:
 
     def _peer_rows(self, peers: list[dict]) -> list[PeerRow]:
         contextual_peers = self._apply_peer_quality_context(peers, None) if any("quality_class" not in peer for peer in peers) else peers
-        visible_peers = [peer for peer in contextual_peers if peer.get("quality_class") != "excluded"]
         rows = [
             PeerRow(
                 ticker=item["ticker"],
@@ -1552,16 +1782,28 @@ class AnalysisService:
                 sector=item["sector"],
                 industry=item["industry"],
                 score=float(item.get("peer_preview_score", self._peer_preview_score(item))),
-                market_cap_bln=round_or_none(item["market_cap_bln"], 2),
+                market_cap_bln=self._peer_market_cap_display_value(item),
                 market_cap_status=str(item.get("market_cap_status") or "valid"),
                 pe_ratio=round_or_none(item["pe_ratio"], 2),
                 roe_pct=round_or_none(item["roe_pct"], 2),
                 revenue_growth_pct=round_or_none(item["revenue_growth_pct"], 2),
                 quality_class=str(item.get("quality_class") or "usable"),
+                quality_note=self._peer_quality_note(item),
             )
-            for item in visible_peers
+            for item in contextual_peers
         ]
-        rows.sort(key=lambda item: item.score, reverse=True)
+        display_order = {
+            str(item.get("ticker") or ""): int(item.get("peer_display_rank", 999))
+            for item in contextual_peers
+        }
+        quality_rank = {"usable": 0, "weak": 1, "excluded": 2}
+        rows.sort(
+            key=lambda item: (
+                display_order.get(item.ticker, 999),
+                quality_rank.get(item.quality_class, 3),
+                -item.score,
+            )
+        )
         return rows[:8]
 
     def _macro_components_and_score(self, macro: dict) -> tuple[list[tuple[float | None, float]], float | None]:
@@ -1670,11 +1912,19 @@ class AnalysisService:
             peer_reasons.append("fallback basket median used")
         if peers.get("valuation_baseline_mode") == "neutral":
             peer_reasons.append("neutral valuation baseline")
-        if peers.get("peer_count_usable", 0) < 3:
+        if peers.get("peer_count_weak", 0) > 0:
+            peer_reasons.append("weak peers included")
+        valuation_disabled = peers.get("valuation_support_mode") == "disabled" or (
+            peers.get("peer_baseline_insufficient") and not peers.get("valuation_low_confidence")
+        )
+        if valuation_disabled:
             warnings.append("Usable peer set too small (<3); valuation was disabled")
             warnings.append("Valuation skipped due to insufficient comparable peers")
         elif peers.get("valuation_low_confidence"):
-            warnings.append("Valuation uses a low-confidence peer baseline with limited comparable coverage")
+            if peers.get("valuation_fallback"):
+                warnings.append("Valuation uses a fallback peer baseline with limited comparable coverage")
+            else:
+                warnings.append("Valuation uses a low-confidence peer baseline with limited comparable coverage")
         if peers.get("peer_selection_confidence") == "low" or peer_reasons:
             warnings.append(f"Peer low confidence: {', '.join(dict.fromkeys(peer_reasons or ['limited relevance']))}")
         if peers.get("market_cap_warning_count", 0) > 0 or peers.get("market_cap_suspect_count", 0) > 0:

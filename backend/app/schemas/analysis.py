@@ -33,6 +33,7 @@ class PeerRow(BaseModel):
     roe_pct: float | None
     revenue_growth_pct: float | None
     quality_class: str = "usable"
+    quality_note: str | None = None
 
 
 class FundamentalTrendPoint(BaseModel):
