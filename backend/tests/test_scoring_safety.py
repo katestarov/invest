@@ -42,8 +42,8 @@ from app.middleware.request_context import correlation_id_middleware
 from app.schemas.analysis import AnalysisResponse
 from app.services.analysis_runtime_service import AnalysisService
 from app.services.analysis_safety import business_type_compatibility, classify_company, is_bank_like_company, normalize_weights, safe_ratio
-from app.services.providers.live_clients import BaseHttpProvider, FredProvider, SecEdgarProvider, _safe_number, _series_latest, summarize_peer_averages
-from app.services.providers.peer_providers import ConfigPeerProvider, PeerCandidate, PeerDiscoveryResult
+from app.services.providers.live_clients import BaseHttpProvider, FredProvider, SecEdgarProvider, _map_sector, _safe_number, _series_latest, summarize_peer_averages
+from app.services.providers.peer_providers import ConfigPeerProvider, FmpPeerProvider, PeerCandidate, PeerDiscoveryResult
 
 
 class ScoringSafetyTests(unittest.TestCase):
@@ -74,6 +74,34 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertEqual(classify_company(ticker="TSLA", sector="Unknown", industry="Unknown")[0], "AUTO_MANUFACTURER")
         self.assertEqual(classify_company(ticker="CVX", sector="Energy", industry="Oil & Gas Integrated")[0], "OIL_GAS")
         self.assertEqual(classify_company(ticker="O", sector="Real Estate", industry="Real Estate Investment Trust")[0], "REIT")
+
+    def test_business_classification_does_not_match_erp_inside_caterpillar(self) -> None:
+        business_type, confidence, reason = classify_company(
+            ticker="CAT",
+            sector="Industrials",
+            industry="Construction Machinery & Equip",
+            company="CATERPILLAR INC",
+        )
+
+        self.assertEqual(business_type, "INDUSTRIALS")
+        self.assertEqual(confidence, "high")
+        self.assertNotIn("erp", reason.lower())
+
+    def test_sector_mapping_handles_defensive_retail_and_utilities(self) -> None:
+        self.assertEqual(_map_sector("Retail-Variety Stores"), "Consumer Defensive")
+        self.assertEqual(_map_sector("Electric Services"), "Utilities")
+
+    def test_business_classification_handles_utilities(self) -> None:
+        business_type, confidence, reason = classify_company(
+            ticker="NEE",
+            sector="Utilities",
+            industry="Electric Services",
+            company="NEXTERA ENERGY INC",
+        )
+
+        self.assertEqual(business_type, "UTILITIES")
+        self.assertEqual(confidence, "high")
+        self.assertIn("electric services", reason)
 
     def test_business_type_compatibility_matrix_examples(self) -> None:
         self.assertEqual(business_type_compatibility("BANK", "INSURANCE"), "REJECT")
@@ -163,6 +191,55 @@ class ScoringSafetyTests(unittest.TestCase):
         self.assertEqual(payload, {"ok": True})
         self.assertEqual(captured["client_kwargs"]["verify"], True)
         self.assertNotIn("verify", captured["request_kwargs"])
+
+    def test_http_provider_stops_retrying_after_rate_limit(self) -> None:
+        original_client = httpx.Client
+        calls = {"count": 0}
+
+        class _FakeClient:
+            def __init__(self, **kwargs) -> None:
+                return None
+
+            def get(self, url: str, **kwargs):
+                calls["count"] += 1
+                request = httpx.Request("GET", url)
+
+                class _Response:
+                    def raise_for_status(self) -> None:
+                        raise httpx.HTTPStatusError("rate limited", request=request, response=httpx.Response(429, request=request))
+
+                return _Response()
+
+            def close(self) -> None:
+                return None
+
+        try:
+            httpx.Client = _FakeClient
+            provider = BaseHttpProvider()
+            with self.assertRaises(httpx.HTTPStatusError):
+                provider._get_json("https://financialmodelingprep.com/stable/stock-peers")
+        finally:
+            httpx.Client = original_client
+
+        self.assertEqual(calls["count"], 1)
+
+    def test_fmp_peer_provider_returns_empty_result_when_rate_limited(self) -> None:
+        provider = FmpPeerProvider.__new__(FmpPeerProvider)
+        provider.api_key = "test"
+        provider._is_rate_limited = lambda exc: True
+        provider._get_json = lambda *args, **kwargs: (_ for _ in ()).throw(
+            httpx.HTTPStatusError(
+                "rate limited",
+                request=httpx.Request("GET", "https://financialmodelingprep.com/stable/stock-peers"),
+                response=httpx.Response(429, request=httpx.Request("GET", "https://financialmodelingprep.com/stable/stock-peers")),
+            )
+        )
+
+        result = provider.discover("AAPL", {"ticker": "AAPL"})
+
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(result.source, "fmp")
+        self.assertIn("rate-limited", result.reason)
 
     def test_correlation_id_middleware_sets_header_and_context(self) -> None:
         app = FastAPI()
@@ -1735,6 +1812,51 @@ class ScoringSafetyTests(unittest.TestCase):
         )
 
         self.assertGreater(weighted_scores["stability"][0], 0.0)
+
+    def test_jpm_bank_profitability_uses_roe_when_roic_and_ebit_are_missing(self) -> None:
+        weighted_scores = self.service._build_weighted_scores(
+            {
+                "roe_pct": 16.0,
+                "roe_score_pct": 16.0,
+                "roic_pct": None,
+                "ebit_margin_pct": None,
+                "debt_to_equity": None,
+                "current_ratio": None,
+                "fcf_margin_pct": None,
+                "pe_premium_pct": 10.0,
+                "pb_premium_pct": 5.0,
+                "revenue_growth_pct": 5.0,
+                "revenue_cagr_like_pct": 4.0,
+                "one_year_return_pct": 12.0,
+                "five_year_return_pct": 85.0,
+                "is_bank_like": True,
+                "peer_count_usable": 4,
+            },
+            {
+                "fed_funds_rate_pct": 4.0,
+                "inflation_pct": 3.0,
+                "unemployment_pct": 4.0,
+                "gdp_growth_pct": 2.0,
+            },
+        )
+
+        self.assertGreater(weighted_scores["profitability"][0], 50.0)
+        self.assertGreater(weighted_scores["growth"][0], 20.0)
+
+    def test_bank_roe_is_not_downgraded_by_equity_to_market_cap_rule(self) -> None:
+        assessment = self.service._roe_assessment(
+            {
+                "net_income_bln": 45.0,
+                "equity_bln": 300.0,
+                "roic_pct": 4.0,
+            },
+            780.0,
+            is_bank_like=True,
+        )
+
+        self.assertTrue(assessment["reliable"])
+        self.assertEqual(assessment["score_input_pct"], assessment["display_pct"])
+        self.assertIsNone(assessment["reason"])
 
     def test_direct_peer_baseline_requires_at_least_three_usable_peers(self) -> None:
         peer_averages = self.service._build_peer_averages(

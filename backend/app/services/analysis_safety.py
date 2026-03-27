@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from statistics import median
 from typing import TypeAlias
 
@@ -190,6 +191,7 @@ _BUSINESS_TYPE_UNIVERSES: dict[str, list[str]] = {
     "HEALTHCARE": ["UNH", "HCA", "CI", "HUM", "ELV", "CVS"],
     "PHARMA": ["LLY", "PFE", "MRK", "JNJ", "BMY", "ABBV"],
     "INDUSTRIALS": ["GE", "CAT", "DE", "HON", "ETN", "EMR"],
+    "UTILITIES": ["NEE", "DUK", "SO", "AEP", "XEL", "D"],
 }
 
 _BUSINESS_TYPE_PROFILE_HINTS: dict[str, tuple[str, str]] = {
@@ -213,7 +215,18 @@ _BUSINESS_TYPE_PROFILE_HINTS: dict[str, tuple[str, str]] = {
     "HEALTHCARE": ("Healthcare", "Healthcare Plans"),
     "PHARMA": ("Healthcare", "Drug Manufacturers"),
     "INDUSTRIALS": ("Industrials", "Industrial Conglomerates"),
+    "UTILITIES": ("Utilities", "Utilities - Regulated Electric"),
 }
+
+
+def _matches_fragment(text: str, fragment: str) -> bool:
+    normalized_text = (text or "").lower()
+    normalized_fragment = (fragment or "").lower().strip()
+    if not normalized_text or not normalized_fragment:
+        return False
+    if normalized_fragment.isalpha() and len(normalized_fragment) <= 4:
+        return re.search(rf"\b{re.escape(normalized_fragment)}", normalized_text) is not None
+    return normalized_fragment in normalized_text
 
 
 def classify_company(
@@ -268,7 +281,18 @@ def classify_company(
         ("PAYMENTS", ("payment", "payments", "card network", "merchant acquiring", "digital wallet", "credit services", "card issuer", "merchant services")),
         ("AUTO_MANUFACTURER", ("automobile", "automobiles", "automotive", "vehicle manufacturer", "auto manufacturer", "electric vehicle", "electric vehicles", "ev manufacturer")),
         ("SEMICONDUCTORS", ("semiconductor", "chip", "gpu", "microprocessor")),
-        ("ENTERPRISE_SOFTWARE", ("enterprise software", "enterprise application", "crm", "erp", "workflow automation")),
+        (
+            "ENTERPRISE_SOFTWARE",
+            (
+                "enterprise software",
+                "enterprise application",
+                "customer relationship management",
+                "enterprise resource planning",
+                "crm software",
+                "erp software",
+                "workflow automation",
+            ),
+        ),
         ("CONSUMER_HARDWARE_ECOSYSTEM", ("consumer electronics", "smartphone", "personal computer", "computer hardware", "hardware ecosystem")),
         ("SOFTWARE", ("software", "saas", "cloud", "enterprise application")),
         ("INTERNET_PLATFORM", ("ride sharing", "ride-sharing", "marketplace", "travel platform", "hosting platform", "internet content", "social media", "digital advertising", "online advertising", "search engine")),
@@ -282,10 +306,12 @@ def classify_company(
         ("PHARMA", ("pharma", "pharmaceutical", "drug", "therapeutic")),
         ("HEALTHCARE", ("healthcare", "health care", "managed care", "hospital")),
         ("INDUSTRIALS", ("industrial", "machinery", "aerospace", "electrical equipment")),
+        ("UTILITIES", ("electric utility", "electric services", "regulated utility", "power generation", "power utility", "gas utility", "water utility", "utility")),
     ]
     for business_type, fragments in strong_rules:
-        if any(fragment in text for fragment in fragments):
-            return business_type, "high", f"matched by keyword {next(fragment for fragment in fragments if fragment in text)!r}"
+        matched_fragment = next((fragment for fragment in fragments if _matches_fragment(text, fragment)), None)
+        if matched_fragment:
+            return business_type, "high", f"matched by keyword {matched_fragment!r}"
 
     if sector and sector.lower() == "financial services":
         return "BANK", "medium", "matched by financial sector fallback"
@@ -295,6 +321,8 @@ def classify_company(
         return "HEALTHCARE", "medium", "matched by healthcare sector fallback"
     if sector and sector.lower() == "industrials":
         return "INDUSTRIALS", "medium", "matched by industrials sector fallback"
+    if sector and sector.lower() == "utilities":
+        return "UTILITIES", "medium", "matched by utilities sector fallback"
     if sector and sector.lower() == "technology":
         return "SOFTWARE", "low", "matched by technology sector fallback"
     if sector and sector.lower() == "real estate":
@@ -333,6 +361,7 @@ _COMPATIBILITY_RULES: dict[str, dict[str, tuple[str, ...]]] = {
     "HEALTHCARE": {"STRICT": ("HEALTHCARE",), "RELATED": ("PHARMA",)},
     "PHARMA": {"STRICT": ("PHARMA",), "RELATED": ("HEALTHCARE",)},
     "INDUSTRIALS": {"STRICT": ("INDUSTRIALS",), "WEAK": ("HOME_IMPROVEMENT_RETAIL",)},
+    "UTILITIES": {"STRICT": ("UTILITIES",), "WEAK": ("INDUSTRIALS",)},
 }
 
 

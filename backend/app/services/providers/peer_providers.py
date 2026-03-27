@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+
+import httpx
 
 from app.core.settings import get_settings
 from app.services.analysis_safety import round_or_none
 from app.services.analysis_safety import get_business_type_universe
 from app.services.providers.live_clients import BaseHttpProvider, _safe_number
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,11 +44,16 @@ class FmpPeerProvider(BaseHttpProvider, PeerProvider):
     def discover(self, ticker: str, company_profile: dict) -> PeerDiscoveryResult:
         if not self.api_key:
             return PeerDiscoveryResult(candidates=[], source=self.source_name, reason="FMP peers API unavailable")
-
-        payload = self._get_json(
-            "https://financialmodelingprep.com/stable/stock-peers",
-            params={"symbol": ticker, "apikey": self.api_key},
-        )
+        try:
+            payload = self._get_json(
+                "https://financialmodelingprep.com/stable/stock-peers",
+                params={"symbol": ticker, "apikey": self.api_key},
+            )
+        except Exception as exc:
+            if self._is_rate_limited(exc):
+                logger.warning("peer_provider_rate_limited", extra={"provider": self.source_name, "ticker": ticker, "status_code": 429})
+                return PeerDiscoveryResult(candidates=[], source=self.source_name, reason="FMP peers API rate-limited")
+            raise
         tickers = self._extract_tickers(payload)
         return PeerDiscoveryResult(
             candidates=[PeerCandidate(ticker=item, source=self.source_name) for item in tickers],
@@ -54,10 +64,16 @@ class FmpPeerProvider(BaseHttpProvider, PeerProvider):
     def fetch_market_cap_snapshot(self, ticker: str) -> tuple[float | None, str | None] | None:
         if not self.api_key:
             return None
-        payload = self._get_json(
-            "https://financialmodelingprep.com/stable/profile",
-            params={"symbol": ticker, "apikey": self.api_key},
-        )
+        try:
+            payload = self._get_json(
+                "https://financialmodelingprep.com/stable/profile",
+                params={"symbol": ticker, "apikey": self.api_key},
+            )
+        except Exception as exc:
+            if self._is_rate_limited(exc):
+                logger.warning("peer_market_cap_rate_limited", extra={"provider": self.source_name, "ticker": ticker, "status_code": 429})
+                return None
+            raise
         values = payload if isinstance(payload, list) else [payload] if isinstance(payload, dict) else []
         item = next((entry for entry in values if isinstance(entry, dict)), None)
         if not item:
@@ -95,11 +111,16 @@ class FinnhubPeerProvider(BaseHttpProvider, PeerProvider):
     def discover(self, ticker: str, company_profile: dict) -> PeerDiscoveryResult:
         if not self.api_key:
             return PeerDiscoveryResult(candidates=[], source=self.source_name, reason="Finnhub peers API unavailable")
-
-        payload = self._get_json(
-            "https://finnhub.io/api/v1/stock/peers",
-            params={"symbol": ticker, "token": self.api_key},
-        )
+        try:
+            payload = self._get_json(
+                "https://finnhub.io/api/v1/stock/peers",
+                params={"symbol": ticker, "token": self.api_key},
+            )
+        except Exception as exc:
+            if self._is_rate_limited(exc):
+                logger.warning("peer_provider_rate_limited", extra={"provider": self.source_name, "ticker": ticker, "status_code": 429})
+                return PeerDiscoveryResult(candidates=[], source=self.source_name, reason="Finnhub peers API rate-limited")
+            raise
         values = payload if isinstance(payload, list) else []
         tickers = [str(item).upper() for item in values if item]
         return PeerDiscoveryResult(
@@ -111,10 +132,16 @@ class FinnhubPeerProvider(BaseHttpProvider, PeerProvider):
     def fetch_market_cap_snapshot(self, ticker: str) -> tuple[float | None, str | None] | None:
         if not self.api_key:
             return None
-        payload = self._get_json(
-            "https://finnhub.io/api/v1/stock/profile2",
-            params={"symbol": ticker, "token": self.api_key},
-        )
+        try:
+            payload = self._get_json(
+                "https://finnhub.io/api/v1/stock/profile2",
+                params={"symbol": ticker, "token": self.api_key},
+            )
+        except Exception as exc:
+            if self._is_rate_limited(exc):
+                logger.warning("peer_market_cap_rate_limited", extra={"provider": self.source_name, "ticker": ticker, "status_code": 429})
+                return None
+            raise
         if not isinstance(payload, dict):
             return None
         market_cap_raw = _safe_number(payload.get("marketCapitalization"))

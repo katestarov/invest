@@ -266,7 +266,18 @@ class AnalysisService:
         aggregated_candidate_tickers: list[str] = []
         provider_batches: list[tuple[PeerDiscoveryResult, list[str]]] = []
         for provider in self.peer_providers:
-            discovery = provider.discover(company_profile["ticker"], company_profile)
+            try:
+                discovery = provider.discover(company_profile["ticker"], company_profile)
+            except Exception as exc:
+                logger.warning(
+                    "peer_provider_discovery_failed",
+                    extra={
+                        "provider": getattr(provider, "source_name", "unknown"),
+                        "ticker": company_profile.get("ticker"),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                continue
             candidate_tickers = self._filter_candidate_tickers_by_business_type(
                 company_profile,
                 [candidate.ticker for candidate in discovery.candidates],
@@ -328,7 +339,7 @@ class AnalysisService:
             supplemental_market_caps=self._supplemental_market_cap_sources(yahoo.get("ticker")),
         )
         market_cap_bln = market_cap_diagnostics["market_cap_bln"]
-        roe_assessment = self._roe_assessment(edgar, market_cap_bln)
+        roe_assessment = self._roe_assessment(edgar, market_cap_bln, is_bank_like=is_bank_like)
         pe_ratio = round_or_none(safe_ratio(market_cap_bln, edgar.get("net_income_bln")), 2)
         pb_ratio = round_or_none(safe_ratio(market_cap_bln, edgar.get("equity_bln")), 2)
         revenue_growth_pct = self._revenue_growth_pct(edgar)
@@ -716,6 +727,8 @@ class AnalysisService:
             return ["JPM", "BAC", "WFC", "C", "USB", "PNC", "GS", "MS"]
         if business_type == "PAYMENTS":
             return ["V", "MA", "AXP", "PYPL", "FI", "GPN", "COF", "DFS"]
+        if business_type == "UTILITIES":
+            return ["NEE", "DUK", "SO", "AEP", "XEL", "D"]
         return []
 
     def _is_mega_cap_tech_pair(self, ticker_a: str | None, ticker_b: str | None) -> bool:
@@ -793,7 +806,13 @@ class AnalysisService:
             return 0.2
         return -0.6
 
-    def _roe_assessment(self, edgar: dict, market_cap_bln: float | None) -> dict[str, float | bool | str | None]:
+    def _roe_assessment(
+        self,
+        edgar: dict,
+        market_cap_bln: float | None,
+        *,
+        is_bank_like: bool = False,
+    ) -> dict[str, float | bool | str | None]:
         net_income = edgar.get("net_income_bln")
         equity = edgar.get("equity_bln")
         roic_pct = clamp_or_none(edgar.get("roic_pct"), 0.0, 100.0)
@@ -806,7 +825,7 @@ class AnalysisService:
         if display_pct is None:
             reliable = False
             reason = "ROE unavailable because equity is non-interpretable"
-        elif equity is not None and equity < self._roe_equity_threshold_bln(market_cap_bln):
+        elif not is_bank_like and equity is not None and equity < self._roe_equity_threshold_bln(market_cap_bln):
             reliable = False
             reason = "ROE treated as unreliable because the equity base is too small relative to market value"
 
@@ -1736,9 +1755,12 @@ class AnalysisService:
         caps = self.scoring_config["caps"]
         valuation_enabled = bool(metrics.get("valuation_enabled", True))
         effective_roe_pct = metrics.get("roe_score_pct", metrics.get("roe_pct"))
+        is_bank_like = bool(metrics.get("is_bank_like"))
+        roe_cap = min(caps["roe_pct"], 25) if is_bank_like else caps["roe_pct"]
+        growth_cap = min(caps["revenue_growth_pct"], 15) if is_bank_like else caps["revenue_growth_pct"]
 
         profitability_components = [
-            (score_positive(effective_roe_pct, caps["roe_pct"]), 0.4),
+            (score_positive(effective_roe_pct, roe_cap), 0.4),
             (score_positive(metrics["roic_pct"], caps["roic_pct"]), 0.35),
             (score_positive(metrics["ebit_margin_pct"], caps["ebit_margin_pct"]), 0.25),
         ]
@@ -1747,10 +1769,13 @@ class AnalysisService:
             (score_positive(metrics["current_ratio"], caps["current_ratio"]), 0.20),
             (score_positive(metrics["fcf_margin_pct"], caps["fcf_margin_pct"]), 0.25),
         ]
-        if metrics.get("is_bank_like"):
+        if is_bank_like:
+            profitability_components = [
+                (score_positive(effective_roe_pct, roe_cap), 1.0),
+            ]
             stability_components = [
-                (score_positive(effective_roe_pct, caps["roe_pct"]), 0.55),
-                (score_positive(metrics["revenue_growth_pct"], caps["revenue_growth_pct"]), 0.25),
+                (score_positive(effective_roe_pct, roe_cap), 0.55),
+                (score_positive(metrics["revenue_growth_pct"], growth_cap), 0.25),
                 (None, 0.20),
             ]
         valuation_components: list[tuple[float | None, float]] = []
@@ -1760,10 +1785,10 @@ class AnalysisService:
                 (score_relative_valuation(metrics["pb_premium_pct"], caps["pb_premium_pct"]), 0.45),
             ]
         growth_components = [
-            (score_positive(metrics["revenue_growth_pct"], caps["revenue_growth_pct"]), 0.55),
-            (score_positive(metrics["revenue_cagr_like_pct"], caps["revenue_growth_pct"]), 0.20),
+            (score_positive(metrics["revenue_growth_pct"], growth_cap), 0.55),
+            (score_positive(metrics["revenue_cagr_like_pct"], growth_cap), 0.20),
         ]
-        if not metrics.get("is_bank_like"):
+        if not is_bank_like:
             growth_components.append((score_positive(metrics["fcf_margin_pct"], caps["fcf_margin_pct"]), 0.25))
         market_components = [
             (score_positive(metrics["one_year_return_pct"], 60), 0.45),
@@ -2072,7 +2097,7 @@ class AnalysisService:
     def _is_bank_like(self, company_profile: dict) -> bool:
         return is_bank_like_company(company_profile.get("sector"), company_profile.get("industry"))
     def _build_completeness_warnings(self, metrics: dict, macro: dict) -> list[str]:
-        profitability_components = [metrics.get("roe_score_pct"), metrics.get("roic_pct"), metrics.get("ebit_margin_pct")]
+        profitability_components = [metrics.get("roe_score_pct")] if metrics.get("is_bank_like") else [metrics.get("roe_score_pct"), metrics.get("roic_pct"), metrics.get("ebit_margin_pct")]
         stability_components = [metrics.get("roe_score_pct"), metrics.get("revenue_growth_pct"), None] if metrics.get("is_bank_like") else [metrics.get("debt_to_equity"), metrics.get("current_ratio"), metrics.get("fcf_margin_pct")]
         valuation_components = [metrics.get("pe_premium_pct"), metrics.get("pb_premium_pct")]
         growth_components = [metrics.get("revenue_growth_pct"), metrics.get("revenue_cagr_like_pct")]

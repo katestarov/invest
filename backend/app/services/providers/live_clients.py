@@ -149,8 +149,10 @@ def _map_sector(sic_description: str) -> str:
         "Healthcare": ["pharmaceutical", "biotech", "medical", "health", "laborator"],
         "Energy": ["oil", "gas", "petroleum", "energy", "drilling"],
         "Industrials": ["industrial", "aerospace", "machinery", "railroad", "transport"],
+        "Consumer Defensive": ["variety store", "variety stores", "discount store", "warehouse club", "grocery", "food retail", "consumer staples"],
         "Consumer Cyclical": ["retail", "automobile", "restaurant", "apparel", "travel", "lodging"],
         "Communication Services": ["media", "telecom", "communication", "broadcast", "entertainment"],
+        "Utilities": ["electric services", "electric utility", "power generation", "regulated electric", "regulated utility", "gas utility", "water utility", "utility"],
     }
     for sector, fragments in mapping.items():
         if any(fragment in text for fragment in fragments):
@@ -183,6 +185,14 @@ class BaseHttpProvider:
     def close(self) -> None:
         self.client.close()
 
+    def _status_code(self, exc: Exception) -> int | None:
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            return exc.response.status_code
+        return None
+
+    def _is_rate_limited(self, exc: Exception) -> bool:
+        return self._status_code(exc) == 429
+
     def _get_json(self, url: str, params: dict | None = None, headers: dict | None = None) -> dict | list:
         cache_key = f"{url}|{params}"
         cached = self.cache.get(cache_key)
@@ -203,10 +213,18 @@ class BaseHttpProvider:
                 return payload
             except Exception as exc:
                 last_error = exc
+                status_code = self._status_code(exc)
                 logger.warning(
                     "http_provider_request_failed",
-                    extra={"url": url, "attempt": attempt + 1, "error_type": type(exc).__name__},
+                    extra={
+                        "url": url,
+                        "attempt": attempt + 1,
+                        "error_type": type(exc).__name__,
+                        "status_code": status_code,
+                    },
                 )
+                if status_code == 429:
+                    break
         if last_error:
             raise last_error
         raise RuntimeError("HTTP request failed without a captured error.")
