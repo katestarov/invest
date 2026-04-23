@@ -180,4 +180,5 @@ docker compose up --build
 ## Подробная документация
 
 - архитектура и алгоритм: [docs/SYSTEM.md](/D:/Downloads/Dev/invest/docs/SYSTEM.md)
+- полный deep dive по архитектуре, скорингу, peer selection и формулам: [docs/SYSTEM_DEEP_DIVE_RU.md](/D:/Downloads/Dev/invest/docs/SYSTEM_DEEP_DIVE_RU.md)
 - запуск и эксплуатация: [docs/OPERATIONS.md](/D:/Downloads/Dev/invest/docs/OPERATIONS.md)
