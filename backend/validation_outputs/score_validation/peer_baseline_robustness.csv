@@ -1,0 +1,4 @@
+scenario,score,verdict,valuation_weight,valuation_mode,valuation_baseline_mode,peer_count_usable,peer_count_weak
+strong_non_bank,59.2,Нейтрально (Neutral),0.1753,normal,peer,3,1
+regular_non_bank,57.2,Нейтрально (Neutral),0.1214,low_confidence,peer,2,1
+fallback_baseline,32.8,Повышенный риск (High Caution),0.082,fallback_low_confidence,peer,1,2

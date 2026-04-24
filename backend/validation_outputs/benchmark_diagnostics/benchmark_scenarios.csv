@@ -1,0 +1,5 @@
+scenario,mean_response_time_sec,min_response_time_sec,max_response_time_sec,used_cache,degraded_mode,fallback_used
+uncached_analysis,0.1602,0.1523,0.1659,False,False,False
+cached_analysis,0.0,0.0,0.0001,True,False,False
+degraded_peer_provider,0.1544,0.1513,0.1581,False,True,True
+fallback_baseline,0.133,0.13,0.1396,False,True,False

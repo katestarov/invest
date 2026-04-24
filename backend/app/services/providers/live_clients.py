@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import httpx
 
@@ -170,7 +170,9 @@ class BaseHttpProvider:
     def __init__(self) -> None:
         settings = get_settings()
         self.timeout = settings.request_timeout_seconds
+        self.max_attempts = max(1, settings.provider_retry_attempts)
         self.cache = TTLCache(ttl_seconds=settings.provider_cache_ttl_seconds, max_items=512)
+        self._suppress_request_failure_log = False
         self.headers = {
             "User-Agent": settings.sec_user_agent,
             "Accept": "application/json,text/plain,*/*",
@@ -200,7 +202,7 @@ class BaseHttpProvider:
             return cached
 
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(self.max_attempts):
             try:
                 response = self.client.get(
                     url,
@@ -214,15 +216,16 @@ class BaseHttpProvider:
             except Exception as exc:
                 last_error = exc
                 status_code = self._status_code(exc)
-                logger.warning(
-                    "http_provider_request_failed",
-                    extra={
-                        "url": url,
-                        "attempt": attempt + 1,
-                        "error_type": type(exc).__name__,
-                        "status_code": status_code,
-                    },
-                )
+                if not getattr(self, "_suppress_request_failure_log", False):
+                    logger.warning(
+                        "http_provider_request_failed",
+                        extra={
+                            "url": url,
+                            "attempt": attempt + 1,
+                            "error_type": type(exc).__name__,
+                            "status_code": status_code,
+                        },
+                    )
                 if status_code == 429:
                     break
         if last_error:
@@ -242,6 +245,7 @@ class YahooFinanceProvider(BaseHttpProvider):
         )
         quote_result: dict[str, object] = {}
         try:
+            self._suppress_request_failure_log = True
             quote = self._get_json(
                 "https://query1.finance.yahoo.com/v7/finance/quote",
                 params={"symbols": ticker},
@@ -251,11 +255,20 @@ class YahooFinanceProvider(BaseHttpProvider):
             if quote_items:
                 quote_result = quote_items[0]
         except Exception as exc:
-            logger.warning(
+            logger.debug(
                 "yahoo_quote_snapshot_unavailable",
-                extra={"ticker": ticker, "error_type": type(exc).__name__},
+                extra={
+                    "ticker": ticker,
+                    "error_type": type(exc).__name__,
+                    "status_code": self._status_code(exc),
+                },
             )
-        chart_result = chart["chart"]["result"][0]
+        finally:
+            self._suppress_request_failure_log = False
+        chart_results = chart.get("chart", {}).get("result", []) if isinstance(chart, dict) else []
+        if not chart_results:
+            raise ValueError(f"Yahoo Finance returned no chart result for {ticker}.")
+        chart_result = chart_results[0]
         meta = chart_result.get("meta", {})
         timestamps = chart_result.get("timestamp", [])
         closes = chart_result["indicators"]["quote"][0].get("close", [])
@@ -266,7 +279,7 @@ class YahooFinanceProvider(BaseHttpProvider):
                 continue
             price_history.append(
                 {
-                    "date": datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"),
+                    "date": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d"),
                     "close": round(parsed_close, 2),
                 }
             )

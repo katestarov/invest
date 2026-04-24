@@ -1,0 +1,5 @@
+scenario,missingness_case,base_score,new_score,score_delta,abs_score_delta,verdict_changed,data_completeness_score,valuation_weight
+strong_non_bank,drop_valuation_inputs,59.2,52.8,-6.4,6.4,False,83.3,0.0
+strong_non_bank,drop_profitability_inputs,59.2,60.2,1.0,1.0,False,83.3,0.21518987341772153
+strong_non_bank,drop_market_inputs,59.2,61.1,1.9,1.9,False,83.3,0.1910112359550562
+strong_non_bank,drop_growth_inputs,59.2,64.3,5.1,5.1,False,75.0,0.2372093023255814

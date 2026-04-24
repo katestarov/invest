@@ -1,0 +1,6 @@
+scenario,score,verdict,valuation_weight,valuation_mode,valuation_baseline_mode,peer_count_usable,peer_count_weak,data_completeness_score
+strong_non_bank,59.2,Нейтрально (Neutral),0.17525773195876287,normal,peer,3,1,100.0
+regular_non_bank,57.2,Нейтрально (Neutral),0.1213618890719385,low_confidence,peer,2,1,100.0
+bank_like,38.1,Повышенный риск (High Caution),0.1875,normal,peer,3,0,58.3
+incomplete_data,23.7,Повышенный риск (High Caution),0.17315854003583894,normal,peer,3,0,58.3
+fallback_baseline,32.8,Повышенный риск (High Caution),0.08204245553643144,fallback_low_confidence,peer,1,2,100.0

@@ -1,0 +1,11 @@
+metric,unit,current_value_or_range,comment
+analysis_response_time_sec,sec,0.1602,Mean response time for a full uncached analysis on the synthetic harness.
+cached_response_time_sec,sec,0.0,Mean response time when the analysis cache path is hit.
+degraded_response_time_sec,sec,0.1544,Mean response time when one peer provider fails and the system continues in degraded mode.
+provider_retry_count,attempts,2,Observed retry attempts in the probe; the ceiling comes from configuration.
+provider_timeout_sec,sec,20.0,Configured timeout for HTTP providers.
+cache_ttl_sec,sec,"analysis=900, provider=1800",TTL values for analysis cache and provider cache.
+analysis_cache_key,key,normalized_ticker,Analysis cache is keyed by normalized ticker.
+peer_group_cache_key,key,ticker|sector|industry|sic,Peer group cache is keyed by the normalized company profile.
+provider_cache_key,key,url|params,Base HTTP provider caches by request URL and query params.
+fallback_behavior,mode,peer / low_confidence / fallback_low_confidence / weak_only_fallback / disabled,Fallback mode is driven by peer support quality instead of a fixed hard-off rule.

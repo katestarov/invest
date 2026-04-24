@@ -14,6 +14,7 @@ class Settings:
     finnhub_api_key: str | None
     sec_user_agent: str
     request_timeout_seconds: float
+    provider_retry_attempts: int
     frontend_origin: str
     analysis_cache_ttl_seconds: int
     provider_cache_ttl_seconds: int
@@ -33,6 +34,7 @@ def get_settings() -> Settings:
         finnhub_api_key=os.getenv("FINNHUB_API_KEY"),
         sec_user_agent=os.getenv("SEC_USER_AGENT", "invest-app research@example.com"),
         request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
+        provider_retry_attempts=max(1, int(os.getenv("PROVIDER_RETRY_ATTEMPTS", "2"))),
         frontend_origin=os.getenv("FRONTEND_ORIGIN", "http://localhost:5173"),
         analysis_cache_ttl_seconds=int(os.getenv("ANALYSIS_CACHE_TTL_SECONDS", "900")),
         provider_cache_ttl_seconds=int(os.getenv("PROVIDER_CACHE_TTL_SECONDS", "1800")),

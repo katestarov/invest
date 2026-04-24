@@ -1,0 +1,582 @@
+from __future__ import annotations
+
+from copy import deepcopy
+
+
+def make_yahoo_payload(
+    *,
+    ticker: str,
+    company: str,
+    current_price: float,
+    market_cap_bln_quote: float | None,
+    one_year_return_pct: float,
+    five_year_return_pct: float,
+    currency: str = "USD",
+    market_cap_quote_currency: str | None = None,
+    shares_outstanding_quote_mln: float | None = None,
+    quote_type: str = "EQUITY",
+    price_history: list[dict] | None = None,
+) -> dict:
+    if shares_outstanding_quote_mln is None and market_cap_bln_quote is not None and current_price > 0:
+        shares_outstanding_quote_mln = round((market_cap_bln_quote * 1000) / current_price, 2)
+    return {
+        "ticker": ticker,
+        "company": company,
+        "currency": currency,
+        "current_price": current_price,
+        "market_cap_bln_quote": market_cap_bln_quote,
+        "market_cap_quote_currency": market_cap_quote_currency or currency,
+        "shares_outstanding_quote_mln": shares_outstanding_quote_mln,
+        "quote_type": quote_type,
+        "one_year_return_pct": one_year_return_pct,
+        "five_year_return_pct": five_year_return_pct,
+        "price_history": deepcopy(price_history or []),
+    }
+
+
+def make_edgar_payload(
+    *,
+    company: str,
+    sector: str,
+    industry: str,
+    sic: str,
+    revenue_bln: list[float],
+    net_income_bln: float | None,
+    equity_bln: float | None,
+    shares_outstanding_mln: float | None,
+    current_ratio: float | None = None,
+    debt_to_equity: float | None = None,
+    roic_pct: float | None = None,
+    ebit_margin_pct: float | None = None,
+    fcf_margin_pct: float | None = None,
+    assets_bln: float | None = None,
+    free_cash_flow_bln: list[float | None] | None = None,
+    revenue_periods: list[dict] | None = None,
+) -> dict:
+    if free_cash_flow_bln is None:
+        free_cash_flow_bln = [round(revenue * (fcf_margin_pct or 0) / 100, 2) if fcf_margin_pct is not None else None for revenue in revenue_bln]
+    if revenue_periods is None:
+        revenue_periods = [
+            {
+                "fy": str(2024 - index),
+                "end": f"{2024 - index}-12-31",
+                "period_type": "annual",
+                "fiscal_period": "FY",
+                "form": "10-K",
+            }
+            for index, _ in enumerate(revenue_bln)
+        ]
+    history = [
+        {
+            "period": str(2024 - index),
+            "revenue_bln": revenue,
+            "free_cash_flow_bln": free_cash_flow_bln[index] if index < len(free_cash_flow_bln) else None,
+        }
+        for index, revenue in enumerate(revenue_bln)
+    ]
+    return {
+        "company": company,
+        "sector": sector,
+        "industry": industry,
+        "sic": sic,
+        "revenue_bln": list(revenue_bln),
+        "free_cash_flow_bln": list(free_cash_flow_bln),
+        "current_ratio": current_ratio,
+        "debt_to_equity": debt_to_equity,
+        "roic_pct": roic_pct,
+        "ebit_margin_pct": ebit_margin_pct,
+        "fcf_margin_pct": fcf_margin_pct,
+        "net_income_bln": net_income_bln,
+        "shares_outstanding_mln": shares_outstanding_mln,
+        "history": history,
+        "assets_bln": assets_bln,
+        "equity_bln": equity_bln,
+        "revenue_periods": deepcopy(revenue_periods),
+    }
+
+
+def make_regular_company_dataset() -> dict:
+    yahoo_payloads = {
+        "ACME": make_yahoo_payload(
+            ticker="ACME",
+            company="Acme Cloud",
+            current_price=80.0,
+            market_cap_bln_quote=320.0,
+            one_year_return_pct=18.0,
+            five_year_return_pct=110.0,
+        ),
+        "ORCL": make_yahoo_payload(ticker="ORCL", company="Oracle Corp", current_price=150.0, market_cap_bln_quote=420.0, one_year_return_pct=12.0, five_year_return_pct=95.0),
+        "CRM": make_yahoo_payload(ticker="CRM", company="Salesforce", current_price=290.0, market_cap_bln_quote=280.0, one_year_return_pct=10.0, five_year_return_pct=70.0),
+        "NOW": make_yahoo_payload(ticker="NOW", company="ServiceNow", current_price=90.0, market_cap_bln_quote=180.0, one_year_return_pct=8.0, five_year_return_pct=85.0),
+        "SAP": make_yahoo_payload(
+            ticker="SAP",
+            company="SAP SE",
+            current_price=0.0,
+            market_cap_bln_quote=None,
+            one_year_return_pct=4.0,
+            five_year_return_pct=40.0,
+            currency="EUR",
+            market_cap_quote_currency="EUR",
+            shares_outstanding_quote_mln=None,
+        ),
+    }
+    edgar_payloads = {
+        "ACME": make_edgar_payload(
+            company="Acme Cloud",
+            sector="Technology",
+            industry="Software - Infrastructure",
+            sic="7372",
+            revenue_bln=[120.0, 108.0, 100.0],
+            net_income_bln=24.0,
+            equity_bln=120.0,
+            shares_outstanding_mln=4000.0,
+            current_ratio=1.8,
+            debt_to_equity=0.35,
+            roic_pct=19.0,
+            ebit_margin_pct=24.0,
+            fcf_margin_pct=18.0,
+            assets_bln=260.0,
+        ),
+        "ORCL": make_edgar_payload(
+            company="Oracle Corp",
+            sector="Technology",
+            industry="Software - Infrastructure",
+            sic="7372",
+            revenue_bln=[58.0, 55.0, 52.0],
+            net_income_bln=11.0,
+            equity_bln=42.0,
+            shares_outstanding_mln=2800.0,
+            current_ratio=1.2,
+            debt_to_equity=1.8,
+            roic_pct=17.0,
+            ebit_margin_pct=28.0,
+            fcf_margin_pct=24.0,
+            assets_bln=140.0,
+        ),
+        "CRM": make_edgar_payload(
+            company="Salesforce",
+            sector="Technology",
+            industry="Software - Application",
+            sic="7372",
+            revenue_bln=[35.0, 32.0, 28.0],
+            net_income_bln=4.0,
+            equity_bln=68.0,
+            shares_outstanding_mln=970.0,
+            current_ratio=1.1,
+            debt_to_equity=0.2,
+            roic_pct=9.0,
+            ebit_margin_pct=17.0,
+            fcf_margin_pct=20.0,
+            assets_bln=110.0,
+        ),
+        "NOW": make_edgar_payload(
+            company="ServiceNow",
+            sector="Technology",
+            industry="Software - Application",
+            sic="7372",
+            revenue_bln=[10.0, 8.8, 7.2],
+            net_income_bln=None,
+            equity_bln=15.0,
+            shares_outstanding_mln=205.0,
+            current_ratio=None,
+            debt_to_equity=None,
+            roic_pct=None,
+            ebit_margin_pct=8.0,
+            fcf_margin_pct=None,
+            assets_bln=25.0,
+        ),
+        "SAP": make_edgar_payload(
+            company="SAP SE",
+            sector="Technology",
+            industry="Software - Infrastructure",
+            sic="7372",
+            revenue_bln=[0.0],
+            net_income_bln=None,
+            equity_bln=None,
+            shares_outstanding_mln=None,
+            current_ratio=None,
+            debt_to_equity=None,
+            roic_pct=None,
+            ebit_margin_pct=None,
+            fcf_margin_pct=None,
+            assets_bln=None,
+        ),
+    }
+    return {
+        "ticker": "ACME",
+        "yahoo_payloads": yahoo_payloads,
+        "edgar_payloads": edgar_payloads,
+        "fred_payload": {"fed_funds_rate_pct": 4.25, "inflation_pct": 3.1, "unemployment_pct": 4.0},
+        "world_bank_payload": {"gdp_growth_pct": 2.1},
+        "peer_discovery": {
+            "fmp": {"ACME": ["ORCL", "CRM", "NOW"]},
+            "finnhub": {"ACME": ["SAP"]},
+            "business_type": {"ACME": ["ORCL", "CRM", "NOW", "SAP"]},
+            "config": {"ACME": ["ORCL", "CRM", "NOW", "SAP"]},
+        },
+        "market_cap_snapshots": {
+            "ACME": {"fmp": (320.0, "USD"), "finnhub": (319.0, "USD")},
+            "ORCL": {"fmp": (420.0, "USD"), "finnhub": (418.0, "USD")},
+            "CRM": {"fmp": (280.0, "USD"), "finnhub": (282.0, "USD")},
+            "NOW": {"fmp": (180.0, "USD"), "finnhub": (179.0, "USD")},
+        },
+    }
+
+
+def make_strong_company_dataset() -> dict:
+    dataset = make_regular_company_dataset()
+    dataset["yahoo_payloads"]["ADBE"] = make_yahoo_payload(
+        ticker="ADBE",
+        company="Adobe",
+        current_price=520.0,
+        market_cap_bln_quote=235.0,
+        one_year_return_pct=14.0,
+        five_year_return_pct=88.0,
+    )
+    dataset["edgar_payloads"]["ADBE"] = make_edgar_payload(
+        company="Adobe",
+        sector="Technology",
+        industry="Software - Infrastructure",
+        sic="7372",
+        revenue_bln=[21.0, 19.0, 17.0],
+        net_income_bln=6.5,
+        equity_bln=18.0,
+        shares_outstanding_mln=452.0,
+        current_ratio=1.4,
+        debt_to_equity=0.3,
+        roic_pct=18.0,
+        ebit_margin_pct=31.0,
+        fcf_margin_pct=29.0,
+        assets_bln=34.0,
+    )
+    dataset["peer_discovery"]["fmp"]["ACME"] = ["ORCL", "CRM", "ADBE", "NOW"]
+    dataset["peer_discovery"]["finnhub"]["ACME"] = ["SAP"]
+    dataset["peer_discovery"]["business_type"]["ACME"] = ["ORCL", "CRM", "ADBE", "NOW", "SAP"]
+    dataset["peer_discovery"]["config"]["ACME"] = ["ORCL", "CRM", "ADBE", "NOW", "SAP"]
+    dataset["market_cap_snapshots"]["ADBE"] = {"fmp": (236.0, "USD"), "finnhub": (234.0, "USD")}
+    return dataset
+
+
+def make_bank_company_dataset() -> dict:
+    yahoo_payloads = {
+        "BNK1": make_yahoo_payload(ticker="BNK1", company="Metro Bank Holdings", current_price=50.0, market_cap_bln_quote=400.0, one_year_return_pct=14.0, five_year_return_pct=65.0),
+        "JPM": make_yahoo_payload(ticker="JPM", company="JPMorgan Chase", current_price=200.0, market_cap_bln_quote=610.0, one_year_return_pct=16.0, five_year_return_pct=80.0),
+        "BAC": make_yahoo_payload(ticker="BAC", company="Bank of America", current_price=42.0, market_cap_bln_quote=310.0, one_year_return_pct=11.0, five_year_return_pct=50.0),
+        "USB": make_yahoo_payload(ticker="USB", company="U.S. Bancorp", current_price=36.0, market_cap_bln_quote=70.0, one_year_return_pct=7.0, five_year_return_pct=25.0),
+    }
+    edgar_payloads = {
+        "BNK1": make_edgar_payload(
+            company="Metro Bank Holdings",
+            sector="Financial Services",
+            industry="Commercial Banks",
+            sic="6021",
+            revenue_bln=[85.0, 80.0, 76.0],
+            net_income_bln=12.0,
+            equity_bln=90.0,
+            shares_outstanding_mln=8000.0,
+            current_ratio=None,
+            debt_to_equity=None,
+            roic_pct=None,
+            ebit_margin_pct=None,
+            fcf_margin_pct=None,
+            assets_bln=620.0,
+        ),
+        "JPM": make_edgar_payload(
+            company="JPMorgan Chase",
+            sector="Financial Services",
+            industry="Banks - Diversified",
+            sic="6021",
+            revenue_bln=[160.0, 150.0, 138.0],
+            net_income_bln=48.0,
+            equity_bln=340.0,
+            shares_outstanding_mln=3050.0,
+            assets_bln=3800.0,
+        ),
+        "BAC": make_edgar_payload(
+            company="Bank of America",
+            sector="Financial Services",
+            industry="Banks - Diversified",
+            sic="6021",
+            revenue_bln=[110.0, 105.0, 100.0],
+            net_income_bln=27.0,
+            equity_bln=270.0,
+            shares_outstanding_mln=7800.0,
+            assets_bln=3300.0,
+        ),
+        "USB": make_edgar_payload(
+            company="U.S. Bancorp",
+            sector="Financial Services",
+            industry="Banks - Regional",
+            sic="6021",
+            revenue_bln=[32.0, 31.0, 30.0],
+            net_income_bln=6.0,
+            equity_bln=58.0,
+            shares_outstanding_mln=1500.0,
+            assets_bln=670.0,
+        ),
+    }
+    return {
+        "ticker": "BNK1",
+        "yahoo_payloads": yahoo_payloads,
+        "edgar_payloads": edgar_payloads,
+        "fred_payload": {"fed_funds_rate_pct": 4.0, "inflation_pct": 2.8, "unemployment_pct": 4.1},
+        "world_bank_payload": {"gdp_growth_pct": 1.9},
+        "peer_discovery": {
+            "fmp": {"BNK1": ["JPM", "BAC"]},
+            "finnhub": {"BNK1": ["USB"]},
+            "business_type": {"BNK1": ["JPM", "BAC", "USB"]},
+            "config": {"BNK1": ["JPM", "BAC", "USB"]},
+        },
+        "market_cap_snapshots": {
+            "BNK1": {"fmp": (401.0, "USD")},
+            "JPM": {"fmp": (610.0, "USD")},
+            "BAC": {"fmp": (312.0, "USD")},
+            "USB": {"finnhub": (71.0, "USD")},
+        },
+    }
+
+
+def make_fallback_baseline_dataset() -> dict:
+    yahoo_payloads = {
+        "AUTOX": make_yahoo_payload(
+            ticker="AUTOX",
+            company="Autox Mobility",
+            current_price=35.0,
+            market_cap_bln_quote=70.0,
+            one_year_return_pct=9.0,
+            five_year_return_pct=35.0,
+        ),
+        "GM": make_yahoo_payload(
+            ticker="GM",
+            company="General Motors",
+            current_price=48.0,
+            market_cap_bln_quote=52.0,
+            one_year_return_pct=6.0,
+            five_year_return_pct=18.0,
+        ),
+        "F": make_yahoo_payload(
+            ticker="F",
+            company="Ford",
+            current_price=12.0,
+            market_cap_bln_quote=46.0,
+            one_year_return_pct=4.0,
+            five_year_return_pct=11.0,
+        ),
+        "RIVN": make_yahoo_payload(
+            ticker="RIVN",
+            company="Rivian",
+            current_price=14.0,
+            market_cap_bln_quote=11.0,
+            one_year_return_pct=-12.0,
+            five_year_return_pct=-20.0,
+        ),
+        "LCID": make_yahoo_payload(
+            ticker="LCID",
+            company="Lucid",
+            current_price=2.5,
+            market_cap_bln_quote=7.0,
+            one_year_return_pct=-35.0,
+            five_year_return_pct=-60.0,
+        ),
+    }
+    edgar_payloads = {
+        "AUTOX": make_edgar_payload(
+            company="Autox Mobility",
+            sector="Consumer Cyclical",
+            industry="Automobiles",
+            sic="3711",
+            revenue_bln=[40.0, 36.0, 31.0],
+            net_income_bln=3.0,
+            equity_bln=22.0,
+            shares_outstanding_mln=2000.0,
+            current_ratio=1.5,
+            debt_to_equity=0.8,
+            roic_pct=9.0,
+            ebit_margin_pct=11.0,
+            fcf_margin_pct=7.0,
+            assets_bln=55.0,
+        ),
+        "GM": make_edgar_payload(
+            company="General Motors",
+            sector="Consumer Cyclical",
+            industry="Auto Manufacturers",
+            sic="3711",
+            revenue_bln=[170.0, 160.0, 150.0],
+            net_income_bln=10.0,
+            equity_bln=58.0,
+            shares_outstanding_mln=1083.0,
+            current_ratio=1.2,
+            debt_to_equity=1.5,
+            roic_pct=8.0,
+            ebit_margin_pct=8.0,
+            fcf_margin_pct=5.0,
+            assets_bln=270.0,
+        ),
+        "F": make_edgar_payload(
+            company="Ford",
+            sector="Unknown",
+            industry="Unknown",
+            sic="3711",
+            revenue_bln=[175.0],
+            net_income_bln=4.0,
+            equity_bln=None,
+            shares_outstanding_mln=3950.0,
+            current_ratio=None,
+            debt_to_equity=None,
+            roic_pct=None,
+            ebit_margin_pct=4.0,
+            fcf_margin_pct=None,
+            assets_bln=285.0,
+        ),
+        "RIVN": make_edgar_payload(
+            company="Rivian",
+            sector="Consumer Cyclical",
+            industry="Auto Manufacturers",
+            sic="3711",
+            revenue_bln=[5.0, 3.5, 2.0],
+            net_income_bln=-3.0,
+            equity_bln=9.0,
+            shares_outstanding_mln=786.0,
+            current_ratio=2.0,
+            debt_to_equity=0.4,
+            roic_pct=None,
+            ebit_margin_pct=-20.0,
+            fcf_margin_pct=-15.0,
+            assets_bln=15.0,
+        ),
+        "LCID": make_edgar_payload(
+            company="Lucid",
+            sector="Consumer Cyclical",
+            industry="Auto Manufacturers",
+            sic="3711",
+            revenue_bln=[0.0],
+            net_income_bln=None,
+            equity_bln=None,
+            shares_outstanding_mln=None,
+            current_ratio=None,
+            debt_to_equity=None,
+            roic_pct=None,
+            ebit_margin_pct=None,
+            fcf_margin_pct=None,
+            assets_bln=None,
+        ),
+    }
+    return {
+        "ticker": "AUTOX",
+        "yahoo_payloads": yahoo_payloads,
+        "edgar_payloads": edgar_payloads,
+        "fred_payload": {"fed_funds_rate_pct": 4.4, "inflation_pct": 3.3, "unemployment_pct": 4.2},
+        "world_bank_payload": {"gdp_growth_pct": 1.8},
+        "peer_discovery": {
+            "fmp": {"AUTOX": ["GM", "F"]},
+            "finnhub": {"AUTOX": ["RIVN", "LCID"]},
+            "business_type": {"AUTOX": ["GM", "F", "RIVN", "LCID"]},
+            "config": {"AUTOX": ["GM", "F", "RIVN", "LCID"]},
+        },
+        "market_cap_snapshots": {
+            "AUTOX": {"fmp": (70.0, "USD")},
+            "GM": {"fmp": (52.0, "USD"), "finnhub": (53.0, "USD")},
+            "F": {"fmp": (46.0, "USD")},
+            "RIVN": {"fmp": (100.0, "USD"), "finnhub": (11.0, "USD")},
+            "LCID": {"fmp": (7.0, "USD")},
+        },
+    }
+
+
+def make_incomplete_company_dataset() -> dict:
+    yahoo_payloads = {
+        "GAPS": make_yahoo_payload(ticker="GAPS", company="Gaps Industrial", current_price=40.0, market_cap_bln_quote=95.0, one_year_return_pct=-5.0, five_year_return_pct=12.0),
+        "GE": make_yahoo_payload(ticker="GE", company="GE Aerospace", current_price=155.0, market_cap_bln_quote=180.0, one_year_return_pct=22.0, five_year_return_pct=140.0),
+        "CAT": make_yahoo_payload(ticker="CAT", company="Caterpillar", current_price=330.0, market_cap_bln_quote=165.0, one_year_return_pct=18.0, five_year_return_pct=120.0),
+        "HON": make_yahoo_payload(ticker="HON", company="Honeywell", current_price=190.0, market_cap_bln_quote=145.0, one_year_return_pct=10.0, five_year_return_pct=60.0),
+    }
+    revenue_periods = [
+        {"fy": "2024", "end": "2024-12-31", "period_type": "annual", "fiscal_period": "FY", "form": "10-K"},
+        {"fy": "2024", "end": "2024-09-30", "period_type": "quarterly", "fiscal_period": "Q3", "form": "10-Q"},
+    ]
+    edgar_payloads = {
+        "GAPS": make_edgar_payload(
+            company="Gaps Industrial",
+            sector="Industrials",
+            industry="Industrial Conglomerates",
+            sic="3510",
+            revenue_bln=[25.0, 22.0],
+            net_income_bln=None,
+            equity_bln=8.0,
+            shares_outstanding_mln=2375.0,
+            current_ratio=0.9,
+            debt_to_equity=2.8,
+            roic_pct=None,
+            ebit_margin_pct=7.0,
+            fcf_margin_pct=None,
+            assets_bln=40.0,
+            revenue_periods=revenue_periods,
+        ),
+        "GE": make_edgar_payload(
+            company="GE Aerospace",
+            sector="Industrials",
+            industry="Specialty Industrial Machinery",
+            sic="3510",
+            revenue_bln=[68.0, 63.0, 59.0],
+            net_income_bln=7.0,
+            equity_bln=18.0,
+            shares_outstanding_mln=1080.0,
+            current_ratio=1.1,
+            debt_to_equity=1.4,
+            roic_pct=11.0,
+            ebit_margin_pct=14.0,
+            fcf_margin_pct=9.0,
+            assets_bln=100.0,
+        ),
+        "CAT": make_edgar_payload(
+            company="Caterpillar",
+            sector="Industrials",
+            industry="Farm & Heavy Construction Machinery",
+            sic="3531",
+            revenue_bln=[66.0, 61.0, 58.0],
+            net_income_bln=11.0,
+            equity_bln=18.0,
+            shares_outstanding_mln=500.0,
+            current_ratio=1.3,
+            debt_to_equity=2.1,
+            roic_pct=16.0,
+            ebit_margin_pct=20.0,
+            fcf_margin_pct=14.0,
+            assets_bln=88.0,
+        ),
+        "HON": make_edgar_payload(
+            company="Honeywell",
+            sector="Industrials",
+            industry="Conglomerates",
+            sic="3510",
+            revenue_bln=[37.0, 36.0, 35.0],
+            net_income_bln=5.5,
+            equity_bln=19.0,
+            shares_outstanding_mln=650.0,
+            current_ratio=1.2,
+            debt_to_equity=1.0,
+            roic_pct=12.0,
+            ebit_margin_pct=17.0,
+            fcf_margin_pct=13.0,
+            assets_bln=75.0,
+        ),
+    }
+    return {
+        "ticker": "GAPS",
+        "yahoo_payloads": yahoo_payloads,
+        "edgar_payloads": edgar_payloads,
+        "fred_payload": {"fed_funds_rate_pct": 4.5, "inflation_pct": 3.4, "unemployment_pct": 4.3},
+        "world_bank_payload": {"gdp_growth_pct": 1.6},
+        "peer_discovery": {
+            "fmp": {"GAPS": ["GE", "CAT"]},
+            "finnhub": {"GAPS": ["HON"]},
+            "business_type": {"GAPS": ["GE", "CAT", "HON"]},
+            "config": {"GAPS": ["GE", "CAT", "HON"]},
+        },
+        "market_cap_snapshots": {
+            "GAPS": {"fmp": (96.0, "USD")},
+            "GE": {"fmp": (181.0, "USD")},
+            "CAT": {"fmp": (166.0, "USD")},
+            "HON": {"finnhub": (146.0, "USD")},
+        },
+    }

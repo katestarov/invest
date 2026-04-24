@@ -1,0 +1,111 @@
+{
+  "benchmark_rows": [
+    {
+      "scenario": "uncached_analysis",
+      "mean_response_time_sec": 0.1602,
+      "min_response_time_sec": 0.1523,
+      "max_response_time_sec": 0.1659,
+      "used_cache": false,
+      "degraded_mode": false,
+      "fallback_used": false
+    },
+    {
+      "scenario": "cached_analysis",
+      "mean_response_time_sec": 0.0,
+      "min_response_time_sec": 0.0,
+      "max_response_time_sec": 0.0001,
+      "used_cache": true,
+      "degraded_mode": false,
+      "fallback_used": false
+    },
+    {
+      "scenario": "degraded_peer_provider",
+      "mean_response_time_sec": 0.1544,
+      "min_response_time_sec": 0.1513,
+      "max_response_time_sec": 0.1581,
+      "used_cache": false,
+      "degraded_mode": true,
+      "fallback_used": true
+    },
+    {
+      "scenario": "fallback_baseline",
+      "mean_response_time_sec": 0.133,
+      "min_response_time_sec": 0.13,
+      "max_response_time_sec": 0.1396,
+      "used_cache": false,
+      "degraded_mode": true,
+      "fallback_used": false
+    }
+  ],
+  "retry_probe": {
+    "payload": {
+      "ok": true
+    },
+    "provider_retry_count": 2,
+    "provider_timeout_sec": 20.0,
+    "provider_retry_attempts_configured": 2,
+    "probe_elapsed_sec": 0.0002
+  },
+  "system_table": [
+    {
+      "metric": "analysis_response_time_sec",
+      "unit": "sec",
+      "current_value_or_range": 0.1602,
+      "comment": "Mean response time for a full uncached analysis on the synthetic harness."
+    },
+    {
+      "metric": "cached_response_time_sec",
+      "unit": "sec",
+      "current_value_or_range": 0.0,
+      "comment": "Mean response time when the analysis cache path is hit."
+    },
+    {
+      "metric": "degraded_response_time_sec",
+      "unit": "sec",
+      "current_value_or_range": 0.1544,
+      "comment": "Mean response time when one peer provider fails and the system continues in degraded mode."
+    },
+    {
+      "metric": "provider_retry_count",
+      "unit": "attempts",
+      "current_value_or_range": 2,
+      "comment": "Observed retry attempts in the probe; the ceiling comes from configuration."
+    },
+    {
+      "metric": "provider_timeout_sec",
+      "unit": "sec",
+      "current_value_or_range": 20.0,
+      "comment": "Configured timeout for HTTP providers."
+    },
+    {
+      "metric": "cache_ttl_sec",
+      "unit": "sec",
+      "current_value_or_range": "analysis=900, provider=1800",
+      "comment": "TTL values for analysis cache and provider cache."
+    },
+    {
+      "metric": "analysis_cache_key",
+      "unit": "key",
+      "current_value_or_range": "normalized_ticker",
+      "comment": "Analysis cache is keyed by normalized ticker."
+    },
+    {
+      "metric": "peer_group_cache_key",
+      "unit": "key",
+      "current_value_or_range": "ticker|sector|industry|sic",
+      "comment": "Peer group cache is keyed by the normalized company profile."
+    },
+    {
+      "metric": "provider_cache_key",
+      "unit": "key",
+      "current_value_or_range": "url|params",
+      "comment": "Base HTTP provider caches by request URL and query params."
+    },
+    {
+      "metric": "fallback_behavior",
+      "unit": "mode",
+      "current_value_or_range": "peer / low_confidence / fallback_low_confidence / weak_only_fallback / disabled",
+      "comment": "Fallback mode is driven by peer support quality instead of a fixed hard-off rule."
+    }
+  ]
+}

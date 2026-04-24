@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,10 +13,25 @@ from app.middleware.request_context import correlation_id_middleware
 settings = get_settings()
 configure_logging(settings.log_level)
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception:
+        # Allow the API to start even if PostgreSQL is temporarily unavailable.
+        pass
+    try:
+        yield
+    finally:
+        routes.service.close()
+
+
 app = FastAPI(
     title="Investment Attractiveness API",
     version="0.1.0",
     description="MVP API for evaluating a company's investment attractiveness against sector peers.",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -28,20 +45,6 @@ app.add_middleware(
 app.middleware("http")(correlation_id_middleware)
 
 app.include_router(router, prefix="/api/v1")
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    try:
-        Base.metadata.create_all(bind=engine)
-    except Exception:
-        # Allow the API to start even if PostgreSQL is temporarily unavailable.
-        pass
-
-
-@app.on_event("shutdown")
-def on_shutdown() -> None:
-    routes.service.close()
 
 
 @app.get("/")

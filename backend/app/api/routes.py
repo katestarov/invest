@@ -1,7 +1,7 @@
 import httpx
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException, Path
 
 from app.schemas.analysis import AnalysisResponse
 from app.services.analysis_runtime_service import AnalysisService
@@ -11,14 +11,18 @@ router = APIRouter()
 service = AnalysisService()
 
 
+def get_analysis_service() -> AnalysisService:
+    return service
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @router.post("/cache/clear")
-def clear_cache() -> dict[str, str]:
-    service.clear_cache()
+def clear_cache(analysis_service: Annotated[AnalysisService, Depends(get_analysis_service)]) -> dict[str, str]:
+    analysis_service.clear_cache()
     return {"status": "cache cleared"}
 
 
@@ -33,9 +37,10 @@ def analyze_company(
             description="Ticker symbol containing only Latin letters and digits.",
         ),
     ],
+    analysis_service: Annotated[AnalysisService, Depends(get_analysis_service)],
 ) -> AnalysisResponse:
     try:
-        return service.analyze(ticker)
+        return analysis_service.analyze(ticker)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except httpx.TimeoutException as exc:

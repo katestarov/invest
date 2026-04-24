@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections.abc import Callable
 from statistics import median
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -52,27 +54,43 @@ logger = logging.getLogger(__name__)
 
 
 class AnalysisService:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        yahoo: YahooFinanceProvider | None = None,
+        edgar: SecEdgarProvider | None = None,
+        fred: FredProvider | None = None,
+        world_bank: WorldBankProvider | None = None,
+        peer_providers: list[object] | None = None,
+        scoring_config: dict | None = None,
+        peer_group_config: dict | None = None,
+        session_factory: Callable[[], Session] | None = None,
+        repository_factory: Callable[[Session], Any] | None = None,
+        peer_group_cache: TTLCache[tuple[list[dict], dict]] | None = None,
+        analysis_cache: TTLCache[AnalysisResponse] | None = None,
+    ) -> None:
         settings = get_settings()
-        self.yahoo = YahooFinanceProvider()
-        self.edgar = SecEdgarProvider()
-        self.fred = FredProvider()
-        self.world_bank = WorldBankProvider()
-        self.scoring_config = get_scoring_config()
-        self.peer_group_config = get_peer_group_config()
+        self.yahoo = yahoo or YahooFinanceProvider()
+        self.edgar = edgar or SecEdgarProvider()
+        self.fred = fred or FredProvider()
+        self.world_bank = world_bank or WorldBankProvider()
+        self.scoring_config = scoring_config or get_scoring_config()
+        self.peer_group_config = peer_group_config or get_peer_group_config()
         self.peer_target_count = settings.peer_target_count
         self.peer_min_valid_count = settings.peer_min_valid_count
-        self.peer_providers = [
+        self.peer_providers = peer_providers or [
             FmpPeerProvider(),
             FinnhubPeerProvider(),
             BusinessTypePeerProvider(),
             ConfigPeerProvider(self.peer_group_config),
         ]
-        self.peer_group_cache = TTLCache[tuple[list[dict], dict]](
+        self.session_factory = session_factory or SessionLocal
+        self.repository_factory = repository_factory or AnalysisRepository
+        self.peer_group_cache = peer_group_cache or TTLCache[tuple[list[dict], dict]](
             ttl_seconds=settings.provider_cache_ttl_seconds,
             max_items=128,
         )
-        self.analysis_cache = TTLCache[AnalysisResponse](
+        self.analysis_cache = analysis_cache or TTLCache[AnalysisResponse](
             ttl_seconds=settings.analysis_cache_ttl_seconds,
             max_items=128,
         )
@@ -218,9 +236,9 @@ class AnalysisService:
         peers: list[dict],
         response: AnalysisResponse,
     ) -> None:
-        session: Session = SessionLocal()
+        session: Session = self.session_factory()
         try:
-            repository = AnalysisRepository(session)
+            repository = self.repository_factory(session)
             repository.save_bronze(ticker, self.yahoo.source_name, yahoo_payload)
             repository.save_bronze(ticker, self.edgar.source_name, edgar_payload)
             repository.save_bronze(ticker, self.fred.source_name, fred_payload)
@@ -229,10 +247,14 @@ class AnalysisService:
             repository.save_gold(ticker, response.score, response.verdict, response.narrative, response.model_dump())
             repository.commit()
         except Exception:
-            session.rollback()
+            rollback = getattr(session, "rollback", None)
+            if callable(rollback):
+                rollback()
             logger.exception("persist_layers_failed", extra={"ticker": ticker})
         finally:
-            session.close()
+            close = getattr(session, "close", None)
+            if callable(close):
+                close()
 
     def _build_peer_group(self, company_profile: dict, yahoo: dict, edgar: dict) -> tuple[list[dict], dict]:
         cache_key = f"{company_profile.get('ticker')}|{company_profile.get('sector')}|{company_profile.get('industry')}|{company_profile.get('sic')}"

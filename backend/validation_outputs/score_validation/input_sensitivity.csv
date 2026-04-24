@@ -1,0 +1,7 @@
+scenario,perturbation,base_score,new_score,score_delta,abs_score_delta,verdict_changed,valuation_weight,data_completeness_score
+strong_non_bank,net_income_up_15pct,59.2,60.0,0.8,0.8,False,0.17525773195876287,100.0
+strong_non_bank,net_income_down_15pct,59.2,58.3,-0.9,0.9,False,0.17525773195876287,100.0
+strong_non_bank,debt_to_equity_up_25pct,59.2,58.8,-0.4,0.4,False,0.17525773195876287,100.0
+strong_non_bank,ebit_margin_down_20pct,59.2,58.4,-0.8,0.8,False,0.17525773195876287,100.0
+strong_non_bank,one_year_return_minus_15pt,59.2,58.3,-0.9,0.9,False,0.17525773195876287,100.0
+strong_non_bank,revenue_current_plus_10pct,59.2,63.2,4.0,4.0,False,0.17525773195876287,100.0
