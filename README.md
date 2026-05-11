@@ -1,184 +1,117 @@
-﻿# Investment Attractiveness MVP
+# Investment Attractiveness
 
-Сервис оценки инвестиционной привлекательности компаний по тикеру. Приложение собирает рыночные, фундаментальные и макроэкономические данные, сравнивает компанию с peer-group внутри ее сектора и формирует итоговую оценку в шкале от `0` до `100`.
+Учебный full-stack сервис для оценки инвестиционной привлекательности публичной компании по тикеру. Backend собирает рыночные, фундаментальные и макроэкономические данные, сравнивает компанию с похожими компаниями и возвращает итоговую оценку от `0` до `100`. Frontend показывает результат в виде понятной аналитической панели.
 
-## Что внутри
+Проект не является инвестиционной рекомендацией. Его цель — показать, как можно собрать данные из разных источников, нормализовать показатели и прозрачно объяснить итоговый score.
 
-- `backend/` — FastAPI API, провайдеры данных, ETL-логика, PostgreSQL-слои и кеширование
-- `frontend/` — React + Vite интерфейс с графиками, таблицами и поиском по тикеру
-- `docs/` — подробная документация по архитектуре, источникам и эксплуатации
-- `docker-compose.yml` — запуск `postgres + backend + frontend`
+## Что реализовано
 
-## Основные возможности
+- FastAPI backend.
+- React + Vite frontend с поиском по тикеру, графиками, peer-table и детализацией score.
+- Получение данных из Yahoo Finance, SEC EDGAR, FRED и World Bank.
+- Подбор peer-group через внешние провайдеры и локальный fallback-конфиг.
+- Расчет показателей `P/E`, `P/B`, `ROE`, `ROIC`, `Debt/Equity`, `Current Ratio`, маржинальности, роста и рыночной динамики.
+- Сохранение слоев `bronze`, `silver`, `gold` в PostgreSQL.
+- TTL-кеш для внешних provider-запросов и готового анализа.
+- Набор unit, integration и scenario tests для ключевой бизнес-логики.
 
-- живые HTTP-источники вместо демо-адаптеров
-- хранение слоев `bronze / silver / gold` в PostgreSQL
-- конфигурируемая формула скоринга
-- rules-based подбор `peer-group`
-- кеширование провайдеров и готового анализа
-- история фундаментальных показателей
-- история цены акции
-- русскоязычный интерфейс с английскими терминами только в скобках
+## Структура проекта
 
-## Источники данных
+```text
+backend/
+  app/
+    api/                 # HTTP routes
+    config/              # scoring и peer-group настройки
+    core/                # settings, database, logging
+    db/                  # SQLAlchemy models
+    repositories/        # сохранение bronze/silver/gold
+    schemas/             # Pydantic response models
+    services/            # расчет анализа и провайдеры данных
+    utils/               # TTL cache
+  tests/                 # автотесты backend
+frontend/
+  src/
+    components/          # компоненты аналитической панели
+    styles/              # стили приложения
+docker-compose.yml       # PostgreSQL + backend + frontend
+```
 
-### Yahoo Finance
+## Как работает анализ
 
-Используется для:
-
-- текущей цены акции
-- истории месячных цен
-- доходности за 1 год
-- доходности за 5 лет
-
-### SEC EDGAR
-
-Используется для:
-
-- официальных фундаментальных показателей
-- выручки
-- чистой и операционной прибыли
-- активов, обязательств и капитала
-- операционного денежного потока и capex
-- числа акций в обращении
-
-На базе SEC рассчитываются:
-
-- `P/E (Price/Earnings)`
-- `P/B (Price/Book)`
-- `ROE (Return on Equity)`
-- `ROIC (Return on Invested Capital)`
-- `Debt/Equity`
-- `Current Ratio`
-- `EBIT Margin`
-- `FCF Margin`
-
-### FRED
-
-Используется для:
-
-- ставки ФРС
-- инфляции
-- безработицы
-
-### World Bank
-
-Используется для:
-
-- роста ВВП США
-
-## Как работает сервис
-
-1. Пользователь вводит тикер.
-2. API проверяет кеш готового анализа.
-3. Если кеша нет, сервис идет во внешние источники.
-4. Сырые ответы сохраняются в `bronze`.
-5. Подбирается `peer-group` по сектору и индустрии.
-6. Считаются нормализованные `silver`-метрики.
-7. Применяется формула скоринга из конфига.
-8. Готовый результат сохраняется в `gold`.
-9. Frontend получает уже готовую витрину и отображает ее.
-
-## Архитектура слоев данных
-
-### Bronze
-
-Сырые ответы внешних API:
-
-- таблица `bronze_snapshots`
-
-### Silver
-
-Нормализованные показатели и peer snapshot:
-
-- таблица `silver_analyses`
-
-### Gold
-
-Итоговая оценка и финальный payload для UI:
-
-- таблица `gold_scores`
-
-## Кеширование
-
-### Кеш провайдеров
-
-TTL-кеширует внешние HTTP-ответы по `url + params`.
-
-Настройка:
-
-- `PROVIDER_CACHE_TTL_SECONDS`
-
-### Кеш анализа
-
-TTL-кеширует готовый `AnalysisResponse` по тикеру.
-
-Настройка:
-
-- `ANALYSIS_CACHE_TTL_SECONDS`
-
-### Сброс кеша
-
-Endpoint:
-
-- `POST /api/v1/cache/clear`
-
-## Конфиги
-
-- формула скоринга: [backend/app/config/scoring.json](/D:/Downloads/Dev/invest/backend/app/config/scoring.json)
-- правила `peer-group`: [backend/app/config/peer_groups.json](/D:/Downloads/Dev/invest/backend/app/config/peer_groups.json)
-
-## Переменные окружения
-
-Файл-шаблон:
-
-- [backend/.env.example](/D:/Downloads/Dev/invest/backend/.env.example)
-
-Основные переменные:
-
-- `DATABASE_URL`
-- `FRED_API_KEY`
-- `SEC_USER_AGENT`
-- `FRONTEND_ORIGIN`
-- `ANALYSIS_CACHE_TTL_SECONDS`
-- `PROVIDER_CACHE_TTL_SECONDS`
+1. Пользователь вводит тикер на frontend.
+2. Backend проверяет кеш готового анализа.
+3. Если кеша нет, сервис запрашивает внешние источники.
+4. Сырые ответы сохраняются в слой `bronze`.
+5. Данные приводятся к единому виду и сохраняются как `silver`.
+6. Сервис подбирает peer-group и считает сравнительные показатели.
+7. Формула из `backend/app/config/scoring.json` собирает итоговый score.
+8. Готовый payload сохраняется в слой `gold` и возвращается frontend.
 
 ## Быстрый запуск
 
-### Backend
+### Через Docker
 
 ```powershell
-cd D:\Downloads\Dev\invest\backend
+docker compose up --build
+```
+
+После запуска:
+
+- frontend: http://localhost:5173
+- backend healthcheck: http://localhost:8000/api/v1/health
+- пример API: http://localhost:8000/api/v1/analyze/AAPL
+
+### Backend локально
+
+```powershell
+cd backend
 py -m venv .venv
-.venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-### Frontend
+### Frontend локально
 
 ```powershell
-cd D:\Downloads\Dev\invest\frontend
+cd frontend
 npm install
 npm run dev
 ```
 
-### Docker
+## Настройка окружения
+
+Шаблон переменных лежит в `backend/.env.example`. Основные параметры:
+
+- `DATABASE_URL` — подключение к PostgreSQL.
+- `SEC_USER_AGENT` — User-Agent для SEC EDGAR.
+- `FRED_API_KEY` — ключ FRED, без него макроблок работает частично.
+- `FMP_API_KEY` и `FINNHUB_API_KEY` — дополнительные источники для peer discovery.
+- `ANALYSIS_CACHE_TTL_SECONDS` и `PROVIDER_CACHE_TTL_SECONDS` — время жизни кеша.
+
+## Проверки
+
+Backend:
 
 ```powershell
-cd D:\Downloads\Dev\invest
-docker compose up --build
+cd backend
+pip install -r requirements-dev.txt
+pytest
 ```
 
-## Что уже проверено
+Frontend:
 
-- backend Python compile — успешно
-- live backend-анализ по реальному тикеру — успешно
-- frontend `tsc -b` — успешно
-- frontend `vite build` — успешно
+```powershell
+cd frontend
+npm run build
+```
 
-## Подробная документация
+## Основные файлы
 
-- архитектура и алгоритм: [docs/SYSTEM.md](/D:/Downloads/Dev/invest/docs/SYSTEM.md)
-- полный deep dive по архитектуре, скорингу, peer selection и формулам: [docs/SYSTEM_DEEP_DIVE_RU.md](/D:/Downloads/Dev/invest/docs/SYSTEM_DEEP_DIVE_RU.md)
-- запуск и эксплуатация: [docs/OPERATIONS.md](/D:/Downloads/Dev/invest/docs/OPERATIONS.md)
+- `backend/app/services/analysis_runtime_service.py` — главный расчет анализа.
+- `backend/app/services/providers/live_clients.py` — клиенты внешних источников.
+- `backend/app/services/providers/peer_providers.py` — подбор peer-group.
+- `backend/app/services/analysis_safety.py` — защитная логика для неполных и шумных данных.
+- `backend/app/config/scoring.json` — веса и параметры скоринга.
+- `backend/app/config/peer_groups.json` — локальные правила подбора похожих компаний.
+- `frontend/src/App.tsx` — основной экран приложения.

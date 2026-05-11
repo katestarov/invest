@@ -182,6 +182,7 @@ class BaseHttpProvider:
             follow_redirects=True,
             headers=self.headers,
             verify=True,
+            trust_env=False,
         )
 
     def close(self) -> None:

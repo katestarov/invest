@@ -19,10 +19,11 @@ export function MetricGrid({ items }: Props) {
                 ? "Лучше peers"
                 : "Слабее peers"
             : "Недостаточно данных");
-        const tone =
-          comparisonLabel === "Лучше peers" ? "up" : comparisonLabel === "Слабее peers" ? "down" : "neutral";
+        const tone = comparisonLabel === "Лучше peers" ? "up" : comparisonLabel === "Слабее peers" ? "down" : "neutral";
         const displayValue = item.display_value ?? (item.value !== null ? `${item.value}` : "N/A");
         const displayBenchmark = item.display_benchmark ?? (item.benchmark !== null ? `${item.benchmark}` : "N/A");
+        const valueLabel = displayValue === "N/A" ? displayValue : `${displayValue}${item.unit}`;
+        const benchmarkLabel = displayBenchmark === "N/A" ? displayBenchmark : `${displayBenchmark}${item.unit}`;
 
         return (
           <article key={item.label} className="metric-card">
@@ -30,14 +31,8 @@ export function MetricGrid({ items }: Props) {
               <span>{item.label}</span>
               <strong className={tone}>{comparisonLabel}</strong>
             </div>
-            <div className="metric-card-value">
-              {displayValue}
-              {item.unit}
-            </div>
-            <div className="metric-card-benchmark">
-              Среднее по группе: {displayBenchmark}
-              {item.unit}
-            </div>
+            <div className="metric-card-value">{valueLabel}</div>
+            <div className="metric-card-benchmark">Среднее по группе: {benchmarkLabel}</div>
             <p>{item.description}</p>
           </article>
         );

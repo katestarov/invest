@@ -53,3 +53,4 @@ export function PriceChart({ points }: Props) {
     </div>
   );
 }
+

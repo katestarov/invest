@@ -1,9 +1,10 @@
 import { FormEvent, useEffect, useState } from "react";
 
-import { BreakdownBarsSafe } from "./components/BreakdownBarsSafe";
+import { BreakdownBars } from "./components/BreakdownBars";
 import { MacroPanel } from "./components/MacroPanel";
-import { MetricGridSafe } from "./components/MetricGridSafe";
+import { MetricGrid } from "./components/MetricGrid";
 import { PeerTable } from "./components/PeerTable";
+import { PriceChart } from "./components/PriceChart";
 import { ScoreRing } from "./components/ScoreRing";
 import { TrendChart } from "./components/TrendChart";
 import type { AnalysisResponse } from "./types";
@@ -24,13 +25,15 @@ export default function App() {
     try {
       const response = await fetch(`${API_BASE}/analyze/${nextTicker.toUpperCase()}`);
       if (!response.ok) {
-        throw new Error("Ticker not found in the demo dataset");
+        const payload = (await response.json().catch(() => null)) as { detail?: string } | null;
+        throw new Error(payload?.detail ?? "Не удалось получить данные по тикеру");
       }
 
       const payload = (await response.json()) as AnalysisResponse;
       setData(payload);
+      setTicker(nextTicker.toUpperCase());
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Request failed");
+      setError(requestError instanceof Error ? requestError.message : "Ошибка запроса");
     } finally {
       setLoading(false);
     }
@@ -52,21 +55,21 @@ export default function App() {
           <span className="eyebrow">Investment Intelligence MVP</span>
           <h1>Система оценки инвестиционной привлекательности организаций</h1>
           <p>
-            FastAPI + React приложение, которое агрегирует несколько источников,
-            нормализует показатели и показывает итоговый скор компании внутри её сектора.
+            Приложение собирает рыночные, фундаментальные и макроэкономические данные,
+            сравнивает компанию с peer-group и выводит итоговую оценку в шкале от 0 до 100.
           </p>
           <form className="ticker-form" onSubmit={handleSubmit}>
             <input
               value={ticker}
-              onChange={(event) => setTicker(event.target.value)}
-              placeholder="Введите тикер, например AAPL"
+              onChange={(event) => setTicker(event.target.value.toUpperCase())}
+              placeholder="Введите тикер, например SIBN, AAPL или JPM"
             />
             <button type="submit" disabled={loading}>
               {loading ? "Загрузка..." : "Анализировать"}
             </button>
           </form>
           <div className="quick-tickers">
-            {["AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "JPM"].map((item) => (
+            {["AAPL", "MSFT", "NVDA", "GOOGL", "JPM", "LLY", "XOM", "TSLA"].map((item) => (
               <button key={item} type="button" onClick={() => void loadAnalysis(item)}>
                 {item}
               </button>
@@ -94,22 +97,26 @@ export default function App() {
 
       {data && (
         <>
-          <MetricGridSafe items={data.metric_cards} />
+          <MetricGrid items={data.metric_cards} />
 
           <section className="dashboard-grid">
-            <BreakdownBarsSafe items={data.score_breakdown} />
+            <BreakdownBars items={data.score_breakdown} />
             <MacroPanel items={data.macro} />
           </section>
 
           <section className="dashboard-grid">
             <TrendChart points={data.fundamentals_history} />
+            <PriceChart points={data.price_history} />
+          </section>
+
+          <section className="dashboard-grid">
             <div className="panel notes-panel">
               <div className="panel-head">
-                <h3>Assumptions & Sources</h3>
-                <span>MVP transparency layer</span>
+                <h3>Прозрачность расчета</h3>
+                <span>Допущения и источники</span>
               </div>
               <div className="notes-block">
-                <h4>Assumptions</h4>
+                <h4>Допущения</h4>
                 <ul>
                   {data.assumptions.map((item) => (
                     <li key={item}>{item}</li>
@@ -117,9 +124,23 @@ export default function App() {
                 </ul>
               </div>
               <div className="notes-block">
-                <h4>Sources</h4>
+                <h4>Источники</h4>
                 <ul>
                   {data.data_sources.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+
+            <div className="panel notes-panel">
+              <div className="panel-head">
+                <h3>Предупреждения по данным</h3>
+                <span>Что важно учитывать</span>
+              </div>
+              <div className="notes-block">
+                <ul>
+                  {(data.warnings.length ? data.warnings : ["Все источники ответили без явных предупреждений."]).map((item) => (
                     <li key={item}>{item}</li>
                   ))}
                 </ul>

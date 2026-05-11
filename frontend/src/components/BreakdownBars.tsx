@@ -16,14 +16,14 @@ export function BreakdownBars({ items }: Props) {
           <div key={item.key} className="breakdown-item">
             <div className="breakdown-meta">
               <strong>{item.label}</strong>
-              <span>{Math.round(item.weight * 100)}% веса</span>
+              <span>{(item.weight * 100).toFixed(1)}%</span>
             </div>
             <div className="breakdown-bar">
-              <div style={{ width: `${item.score}%` }} />
+              <div style={{ width: `${item.score ?? 0}%`, opacity: item.score === null ? 0.35 : 1 }} />
             </div>
             <div className="breakdown-meta">
               <span>{item.summary}</span>
-              <strong>{item.score}</strong>
+              <strong>{item.score === null ? "N/A" : item.score.toFixed(1)}</strong>
             </div>
           </div>
         ))}

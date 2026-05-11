@@ -32,3 +32,4 @@ export function ScoreRing({ score, verdict }: Props) {
     </div>
   );
 }
+

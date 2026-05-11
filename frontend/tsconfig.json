@@ -13,16 +13,5 @@
     "jsx": "react-jsx",
     "strict": true
   },
-  "include": ["src"],
-  "exclude": [
-    "src/App.tsx",
-    "src/AppView.tsx",
-    "src/components/BreakdownBars.tsx",
-    "src/components/MacroPanel.tsx",
-    "src/components/MetricGrid.tsx",
-    "src/components/PeerTable.tsx",
-    "src/components/PriceChart.tsx",
-    "src/components/ScoreRing.tsx",
-    "src/components/TrendChart.tsx"
-  ]
+  "include": ["src"]
 }
